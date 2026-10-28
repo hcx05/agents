@@ -47,14 +47,44 @@ agent resume <Agent Session ID>   # 顯示先前聊天室內容，再用原本�
 
 - **會恢復**：Manager 與 Worker 的 CLI Session ID、`preamble_sent`（已成功套用的 preamble 不會重送）、任務狀態、等待使用者回答的 `ask_user` 問題、排隊中的訊息／Worker 回報／系統通知、先前的聊天紀錄（`events.jsonl`）。
 - **不會自動重做**：上次被切斷、結果未知的 turn（Manager 正在處理的訊息、Worker 進行中的任務）。Worker 任務會標為 `interrupted`，聊天室會列出哪些你的訊息需要重送；檔案不會還原。保留下來的排隊項目恢復後先**暫停**，輸入 `/continue` 才處理（直接輸入新訊息也會處理，排在它們之後；`/interrupt` 丟棄）。
-- **同一 Session 只允許一個寫入者**：Session 目錄內有 `session.lock`（pid + 心跳）。擁有者還活著就拒絕，絕不覆蓋；擁有者已消失（當機）才接手殘留鎖。若鎖看起來卡住但程序仍在，訊息會告訴你要手動刪哪個檔案。
+- **同一 Session 只允許一個寫入者**：Session 目錄內的 `session.lock` 是作業系統層級的檔案鎖（Windows `msvcrt.locking`、POSIX `flock`），擁有者存活期間一直持有；程式被強制結束時由作業系統自動放掉，所以**沒有殘留鎖，也沒有「接手」競爭**——多個程序同時搶，只有一個拿得到。鎖檔本身從不被刪除，`release()` 只放開自己的鎖。檔內的 pid／主機只是給被拒絕者看的說明。
+- Session ID 只接受 `agent sessions` 列出的格式（英數、`-`、`_`），路徑分隔符、`..`、磁碟機代號、絕對路徑、指向 Sessions 資料夾外的連結一律拒絕。
 - 必須在原本的資料夾內恢復（否則加 `--here`）；設定檔中某個 Agent 的 CLI 與原 Session 不同會拒絕恢復（模型／effort 不同只是警告）。
 - 舊版（v1）Session 可讀可恢復，但當時沒有保存的暫存訊息無法復原。
 - Claude 的 `-p` Session 預設只保留約 30 天（CLI 的 `cleanupPeriodDays`），過期後會出現 `session_lost`，本工具不會自動換新 Session。
 
 ### 實驗：原生 Claude Session 匯入（尚未成為正式功能）
 
-底層已備妥 `--resume <id> --fork-session` 的安全規則（fork 後 Session ID 必須是新的、原 Session 不能被當成工作 Session、一般 resume 仍拒絕 ID 變更），但**沒有** `agent <Claude Session ID>` 這個指令。是否可行用拋棄式 Session 驗證：`python probe.py claude --tests fork`（約 3 次小額度呼叫，只用腳本自己建立的 Session）。`python probe.py agy --tests keys` 只印出 agy 事件的欄位名稱，用來確認它有沒有模型欄位。
+底層已備妥 `--resume <id> --fork-session` 的安全規則（fork 後 Session ID 必須是新的、原 Session 不能被當成工作 Session、一般 resume 仍拒絕 ID 變更），但**沒有** `agent <Claude Session ID>` 指令。兩個實驗要分清楚：
+
+| 實驗 | 驗證什麼 | 不能證明什麼 |
+|---|---|---|
+| `fork-headless` | 腳本自己用 `claude -p` 建立拋棄式 Session 再 fork：fork 旗標、新 ID、fork 後的 Manager JSON 協議 | 互動視窗建立的 Session 是否行得通 |
+| `fork-interactive` | 你在互動式 `claude` 視窗建立的真實 Session，以**副本**方式 fork | — |
+
+兩者在 Claude Code 的終端內（環境變數 `CLAUDE_CODE_SESSION_ID` 存在）會**直接停止（結束碼 3）**，不呼叫 CLI。`python probe.py agy --tests keys` 只印出 agy 事件的欄位名稱。
+
+**Windows 驗證互動式 Session 匯入的步驟**（請在一般 PowerShell 視窗，不要在 Claude Code 內）：
+
+```powershell
+# 1. 在一個拋棄式資料夾開互動式 Claude，聊幾輪（例如：請記住暗號 PINEAPPLE-42，並描述你正在整理的主題），然後 /exit
+mkdir $env:TEMPork-test; cd $env:TEMPork-test; claude
+
+# 2. 找出該 Session 的 ID（= 最新 .jsonl 的檔名，不含副檔名），並記下原檔的雜湊
+Get-ChildItem $env:USERPROFILE\.claude\projects -Recurse -Filter *.jsonl | Sort-Object LastWriteTime | Select-Object -Last 3 FullName, Length, LastWriteTime
+Get-FileHash <上面最新的 .jsonl 完整路徑>
+
+# 3. 等兩分鐘（或確認該 Claude 視窗已關閉），回到本專案資料夾，先不加 --confirm-fork：只會檢查並說明，不送任何內容
+py probe.py claude --tests fork-interactive --session-id <ID>
+
+# 4. 確認後執行（會把整段對話以副本送給模型，用量隨對話長度增加）
+py probe.py claude --tests fork-interactive --session-id <ID> --confirm-fork
+
+# 5. 再算一次雜湊，必須與步驟 2 完全相同；並用 claude --resume <ID> 確認原對話仍可正常開啟、內容沒有多出 Manager JSON 訊息
+Get-FileHash <同一個 .jsonl>
+```
+
+預期：所有項目 PASS、原檔雜湊不變。任何一項 FAIL 就不要推進匯入功能。
 
 ### 每則回覆的模型
 

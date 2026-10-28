@@ -6,8 +6,12 @@
     python probe.py claude --tests version,schema,resume,badmodel,effort,perm,interrupt
     python probe.py agy --tests version,help,plain,resume,stdin,stdin-conv,stdin-schema,badmodel,effort,perm,interrupt
     python probe.py agy --command "C:\\path\\to\\agy.exe"
-    python probe.py claude --tests fork    # EXPERIMENT (opt-in, ~3 small model calls): can a native session be forked
-                                           # and then obey the Manager JSON protocol? uses a throwaway session only
+    python probe.py claude --tests fork-headless      # EXPERIMENT A (~3 small calls): fork a headless `claude -p` session
+                                                      # this script creates itself. Proves the CLI mechanics only.
+    python probe.py claude --tests fork-interactive --session-id <uuid> [--confirm-fork]
+                                                      # EXPERIMENT B: fork a session YOU made in an interactive window
+                                                      # (as a copy; the original is only read). See README for steps.
+                                                      # Both stop (exit 3) inside a Claude Code shell (CLAUDE_CODE_SESSION_ID).
     python probe.py agy --tests keys       # EXPERIMENT (opt-in, 1 small call): which keys do agy's events carry
                                            # (is there a model field?) - prints key NAMES only
 
@@ -20,6 +24,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -120,8 +125,10 @@ def probe_claude(prefix, cwd, tests):
         record_permission("claude", r.denials, created)
     if "interrupt" in tests:
         probe_interrupt(ad, cwd)
-    if "fork" in tests:
-        probe_fork(ad, prefix, cwd)
+    if "fork" in tests or "fork-headless" in tests:
+        probe_fork_headless(ad, prefix, cwd)
+    if "fork-interactive" in tests:
+        probe_fork_interactive(ad, prefix, cwd)
 
 
 def claude_config_dir() -> Path:
@@ -142,61 +149,135 @@ def file_fingerprint(path):
     return (len(data), hashlib.sha256(data).hexdigest())
 
 
-def probe_fork(ad, prefix, cwd):
-    """Can a NATIVE (free-form) Claude session be forked and then act as the Manager (JSON protocol, dispatch)?
-    Only a throwaway session created right here is ever used; nothing of yours is touched. Steps:
-      1 create a plain conversation (no schema, no preamble)      2 fork it with the Manager preamble + schema
-      3 check: new id, original transcript byte-identical, JSON valid, context kept, dispatch to a worker works."""
-    print("\n-- fork experiment (throwaway session in a temp folder) --")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+RECENT_SEC = 120                      # a transcript touched this recently may still be written by a live Claude window
+OPTS = {"session_id": None, "confirm_fork": False}
+
+
+def fork_blocker():
+    """Why the fork experiments must NOT run in this shell, or None. Inside a Claude Code session the CLI may reuse the
+    outer session's id for new/forked sessions, which would make every id check meaningless AND could cross-link
+    this experiment with the live session. Stop, do not warn-and-continue."""
     if os.environ.get("CLAUDE_CODE_SESSION_ID"):
-        print("   WARNING: CLAUDE_CODE_SESSION_ID is set (this shell runs inside a Claude Code session). The CLI may then "
-              "use THAT id for new/forked sessions, which makes the 'new id' check less meaningful. Run this from a plain "
-              "PowerShell window.")
-    print(f"   launcher kind: {prefix[0]!r}  cmd-shim: {runner.is_cmd_shim(prefix)}")
-    saved_a = []
-    ra = ad.run(TurnRequest("probe", "Remember this code word: PINEAPPLE-42. Reply with one short sentence.", cwd, None,
-                            timeout=240), threading.Event(), saved_a.append)
-    record("fork: native-style session created", "PASS" if ra.ok and ra.session_id else "FAIL", ra.error or ra.session_id or "")
-    if not (ra.ok and ra.session_id):
-        return
-    a_id = ra.session_id
-    t_before = find_transcript(a_id)
-    fp_before = file_fingerprint(t_before)
-    record("fork: original transcript located (for the unchanged check)", "PASS" if fp_before else "UNKNOWN",
-           str(t_before) if t_before else "not found under CLAUDE_CONFIG_DIR/projects; unchanged-check will be skipped")
+        return ("CLAUDE_CODE_SESSION_ID is set: this shell is running inside a Claude Code session. Nothing was run. "
+                "Open a plain PowerShell window (not a Claude Code terminal) and run the probe there.")
+    return None
+
+
+def stop(name, why):
+    record(name, "STOPPED", why)
+
+
+def transcript_entrypoint(path):
+    """Informational only: the `entrypoint` value Claude Code wrote into the transcript (internal, unstable field)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for _, line in zip(range(200), f):
+                try:
+                    v = json.loads(line).get("entrypoint")
+                except (ValueError, AttributeError):
+                    continue
+                if isinstance(v, str):
+                    return v
+    except OSError:
+        pass
+    return None
+
+
+def fork_and_check(ad, cwd, a_id, t_path, label, question, code_word=None):
+    """Steps shared by both experiments. The ORIGINAL session is only ever passed to `--resume ... --fork-session`
+    (the adapter also refuses a fork that stays on the original id); every later call uses the fork's own id."""
+    fp_before = file_fingerprint(t_path)
+    record(f"{label}: original transcript located (for the unchanged check)", "PASS" if fp_before else "UNKNOWN",
+           str(t_path) if t_path else "not found under CLAUDE_CONFIG_DIR/projects; unchanged-check will be skipped")
     pre = protocol.manager_preamble("manager", [("w1", "agy")])
     saved_b = []
-    rb = ad.run(TurnRequest("probe", pre + "\n\n---\n[from user]\nWhat code word did I give you earlier? Report it to me "
-                            "with a final action.\n\n[system] team status -> w1: free; manager turns used 1/30", cwd, a_id,
-                            schema=protocol.MANAGER_SCHEMA, fork=True, timeout=300), threading.Event(), saved_b.append)
-    record("fork: fork turn succeeded", "PASS" if rb.ok else "FAIL", f"{rb.error_kind}: {rb.error}" if not rb.ok else rb.mode)
+    rb = ad.run(TurnRequest("probe", pre + "\n\n---\n[from user]\n" + question + "\n\n[system] team status -> w1: free; "
+                            "manager turns used 1/30", cwd, a_id, schema=protocol.MANAGER_SCHEMA, fork=True, timeout=600),
+                threading.Event(), saved_b.append)
+    record(f"{label}: fork turn succeeded", "PASS" if rb.ok else "FAIL", f"{rb.error_kind}: {rb.error}" if not rb.ok else rb.mode)
     b_id = saved_b[0] if saved_b else None
-    record("fork: new session id, original id not reported as the working session",
+    record(f"{label}: new session id, original not used as the working session",
            "PASS" if (b_id and b_id != a_id and rb.session_id == b_id) else "FAIL", f"original={a_id} fork={b_id}")
-    fp_after = file_fingerprint(t_before)
+    fp_after = file_fingerprint(t_path)
     if fp_before:
-        record("fork: original transcript unchanged", "PASS" if fp_after == fp_before else "FAIL",
+        record(f"{label}: original transcript unchanged", "PASS" if fp_after == fp_before else "FAIL",
                f"before={fp_before[0]}B after={fp_after[0] if fp_after else None}B")
     if rb.ok:
         obj, perr = protocol.extract_json(rb.text)
         errs = protocol.validate_manager_message(obj, protocol.TeamView("manager", ["w1"], {})) if obj else [perr or "no JSON"]
-        record("fork: Manager JSON protocol obeyed after fork", "PASS" if not errs else "FAIL", "; ".join(errs)[:160])
+        record(f"{label}: Manager JSON protocol obeyed after fork", "PASS" if not errs else "FAIL", "; ".join(errs)[:160])
         fin = next((x for x in (obj or {}).get("actions", []) if x.get("type") == "final"), None)
-        record("fork: earlier conversation context retained", "PASS" if fin and "PINEAPPLE" in fin.get("text", "").upper() else "FAIL",
-               (fin or {}).get("text", rb.text)[:80])
+        if code_word:
+            record(f"{label}: earlier conversation context retained",
+                   "PASS" if fin and code_word in fin.get("text", "").upper() else "FAIL", (fin or {}).get("text", rb.text)[:80])
+        else:
+            record(f"{label}: answer about the earlier conversation (judge it yourself)", "UNKNOWN",
+                   redact((fin or {}).get("text", rb.text))[:300])
     if b_id:
         saved_c = []
         rc = ad.run(TurnRequest("probe", "[from user]\nDelegate to worker w1 the task with task_id t1 and text 'say hi'. "
-                                "Use a dispatch action only.\n\n[system] team status -> w1: free; manager turns used 1/30",
-                                cwd, b_id, schema=protocol.MANAGER_SCHEMA, timeout=300), threading.Event(), saved_c.append)
+                                "Use a dispatch action only.\n\n[system] team status -> w1: free; manager turns used 2/30",
+                                cwd, b_id, schema=protocol.MANAGER_SCHEMA, timeout=600), threading.Event(), saved_c.append)
         obj, perr = protocol.extract_json(rc.text) if rc.ok else (None, rc.error)
         errs = protocol.validate_manager_message(obj, protocol.TeamView("manager", ["w1"], {})) if obj else [perr or "no JSON"]
         has_dispatch = bool(obj) and any(x.get("type") == "dispatch" and x.get("to") == "w1" for x in obj.get("actions", []))
-        record("fork: forked Manager can dispatch to the configured worker", "PASS" if (not errs and has_dispatch) else "FAIL",
+        record(f"{label}: forked Manager can dispatch to the configured worker", "PASS" if (not errs and has_dispatch) else "FAIL",
                "; ".join(errs)[:120] or ("dispatch ok" if has_dispatch else "no dispatch action"))
-        record("fork: later resume of the fork keeps its id", "PASS" if (rc.ok and saved_c == [] and rc.session_id == b_id) else "FAIL",
+        record(f"{label}: later resume of the fork keeps its id", "PASS" if (rc.ok and saved_c == [] and rc.session_id == b_id) else "FAIL",
                f"{rc.error_kind}: {rc.error}" if not rc.ok else f"saved={saved_c}")
-    print("   (the throwaway sessions stay in Claude's own storage; they hold no data of yours)")
+        fp_end = file_fingerprint(t_path)
+        if fp_before:
+            record(f"{label}: original transcript still unchanged after all calls", "PASS" if fp_end == fp_before else "FAIL", "")
+        print(f"   the fork copy is session {b_id}; it stays in Claude's own storage (your original is not modified)")
+
+
+def probe_fork_headless(ad, prefix, cwd):
+    """EXPERIMENT A (headless): fork a plain `claude -p` conversation that this script itself creates. This proves the
+    CLI mechanics (fork flag, new id, JSON protocol after fork). It says NOTHING about sessions created in an
+    interactive Claude window: use fork-interactive for that."""
+    print("\n-- fork-headless: throwaway `claude -p` session created by this script --")
+    why = fork_blocker()
+    if why:
+        return stop("fork-headless: refused to run", why)
+    print(f"   launcher kind: {prefix[0]!r}  cmd-shim: {runner.is_cmd_shim(prefix)}")
+    ra = ad.run(TurnRequest("probe", "Remember this code word: PINEAPPLE-42. Reply with one short sentence.", cwd, None,
+                            timeout=240), threading.Event(), lambda s: None)
+    record("fork-headless: free-form session created", "PASS" if ra.ok and ra.session_id else "FAIL", ra.error or ra.session_id or "")
+    if not (ra.ok and ra.session_id):
+        return
+    fork_and_check(ad, cwd, ra.session_id, find_transcript(ra.session_id), "fork-headless",
+                   "What code word did I give you earlier? Report it to me with a final action.", code_word="PINEAPPLE")
+    print("   NOTE: a headless session is not an interactive one; this does not validate importing a real interactive session.")
+
+
+def probe_fork_interactive(ad, prefix, cwd):
+    """EXPERIMENT B (interactive): fork a session YOU created in a normal interactive `claude` window. The original is
+    only read (size + hash) and only passed to --resume --fork-session. Required: --session-id and --confirm-fork."""
+    print("\n-- fork-interactive: a real interactive Claude session of yours, forked as a COPY --")
+    why = fork_blocker()
+    if why:
+        return stop("fork-interactive: refused to run", why)
+    sid = OPTS["session_id"]
+    if not sid or not UUID_RE.match(sid):
+        return stop("fork-interactive: refused to run", "pass --session-id <uuid> (the file name of the session's .jsonl "
+                                                         "under %USERPROFILE%\\.claude\\projects\\<project>\\)")
+    t_path = find_transcript(sid)
+    if t_path is None:
+        return stop("fork-interactive: refused to run", f"no single transcript for {sid} under {claude_config_dir() / 'projects'} "
+                                                        "(missing, or the id exists in more than one project folder)")
+    age = time.time() - t_path.stat().st_mtime
+    if age < RECENT_SEC:
+        return stop("fork-interactive: refused to run", f"{t_path.name} was written {int(age)}s ago: it may still be open in a "
+                                                        "Claude window. Exit that session (/exit), wait two minutes, retry.")
+    print(f"   transcript: {t_path}  ({t_path.stat().st_size} bytes, entrypoint field: {transcript_entrypoint(t_path) or 'unknown'})")
+    print("   The fork RESUMES the whole conversation as a copy, so the entire history is sent to the model: the quota used "
+          "grows with its length. Your original session is not modified.")
+    if not OPTS["confirm_fork"]:
+        return stop("fork-interactive: waiting for confirmation", "nothing was sent. Re-run with --confirm-fork to proceed")
+    print(f"   launcher kind: {prefix[0]!r}  cmd-shim: {runner.is_cmd_shim(prefix)}")
+    fork_and_check(ad, cwd, sid, t_path, "fork-interactive",
+                   "In one or two sentences, what were we working on in this conversation? Answer with a final action.")
 
 
 def probe_agy_keys(prefix, cwd):
@@ -333,7 +414,11 @@ def main():
     ap.add_argument("cli", choices=["claude", "agy"])
     ap.add_argument("--tests", help="comma list; default = everything for that CLI")
     ap.add_argument("--command", help="explicit path to the CLI executable")
+    ap.add_argument("--session-id", help="fork-interactive only: UUID of YOUR interactive Claude session to fork as a copy")
+    ap.add_argument("--confirm-fork", action="store_true",
+                    help="fork-interactive only: acknowledge that the whole conversation is sent to the model")
     a = ap.parse_args()
+    OPTS["session_id"], OPTS["confirm_fork"] = a.session_id, a.confirm_fork
     tests = set((a.tests or DEFAULTS[a.cli]).split(","))
     try:
         prefix = runner.resolve_command(a.command or a.cli)
@@ -351,6 +436,8 @@ def main():
     out.write_text(json.dumps([{"test": n, "status": s, "detail": redact(d)} for n, s, d in RESULTS],
                               indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nresults saved: {out}")
+    if any(s == "STOPPED" for _, s, _ in RESULTS):
+        return 3                                   # a safety stop is not a pass: the experiment did not run
     return 0 if all(s in ("PASS", "UNKNOWN", "NOT-OBS") for _, s, _ in RESULTS) else 1
 
 

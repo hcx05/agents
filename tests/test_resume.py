@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agent import cli, resume  # noqa: E402
 from agent.config import parse_config  # noqa: E402
 from agent.orchestrator import State  # noqa: E402
-from agent.sessionlock import LOCK_NAME, SessionLock, SessionLocked, pid_alive  # noqa: E402
+from agent.sessionlock import LOCK_NAME, SessionLock, SessionLocked  # noqa: E402
 from agent.store import STATE_VERSION, Store, StoreError  # noqa: E402
 from agent.ui import BufferUI  # noqa: E402
 from tests.rig import Rig, M, W, answer, ask, dispatch, final  # noqa: E402
@@ -304,6 +304,30 @@ class TestInterruptedWorkAndQueues(Base):
         self.assertEqual(r.chat_lines()[-1], "Manager> @Me 修好了")
 
 
+LOCK_WORKER = Path(__file__).with_name("lock_worker.py")
+
+
+def spawn_workers(session_dir, n, tmp, hold_sec=1.5, extra=()):
+    """n real OS processes that all try to take the same session lock at the same instant (released by a flag file)."""
+    go, done = tmp / "go.flag", tmp / "done.flag"
+    for f in (go, done):
+        if f.exists():
+            f.unlink()
+    procs = [subprocess.Popen([sys.executable, str(LOCK_WORKER), str(session_dir), str(go), str(done), str(hold_sec), *extra],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(n)]
+    time.sleep(1.0 + 0.1 * n)                       # every worker has imported and is spinning on the go flag
+    go.write_text("go")
+    return procs, done
+
+
+def reap(procs):
+    for p in procs:
+        p.wait(timeout=30)
+        for pipe in (p.stdout, p.stderr):
+            if pipe:
+                pipe.close()
+
+
 class TestLockFile(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="agent lock "))
@@ -315,76 +339,152 @@ class TestLockFile(unittest.TestCase):
         with self.assertRaises(SessionLocked) as cm:
             b.acquire()
         self.assertIn("in use by another agent process", str(cm.exception))
+        self.assertTrue(SessionLock.is_locked(self.dir))
         a.release()
-        self.assertFalse((self.dir / LOCK_NAME).exists())
+        self.assertFalse(SessionLock.is_locked(self.dir))
         b.acquire()
         b.release()
 
-    def test_stale_lock_of_a_dead_process_is_taken_over(self):
-        p = subprocess.Popen([sys.executable, "-c", "pass"])
-        p.wait()
-        (self.dir / LOCK_NAME).write_text(json.dumps({"pid": p.pid, "host": __import__("socket").gethostname(),
-                                                      "token": "old", "created": 1}), encoding="utf-8")
-        self.assertFalse(pid_alive(p.pid))
-        lk = SessionLock(self.dir)
-        lk.acquire()
-        self.assertEqual(lk.read()["token"], lk.token)
-        lk.release()
-
-    def test_live_owner_is_never_overwritten_even_with_old_heartbeat(self):
-        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-        self.addCleanup(p.kill)
-        f = self.dir / LOCK_NAME
-        f.write_text(json.dumps({"pid": p.pid, "host": __import__("socket").gethostname(), "token": "theirs",
-                                 "created": 1}), encoding="utf-8")
-        os.utime(f, (time.time() - 3600, time.time() - 3600))
-        with self.assertRaises(SessionLocked) as cm:
-            SessionLock(self.dir).acquire()
-        self.assertIn("delete", str(cm.exception))                       # tells the user what to do by hand
-        self.assertEqual(json.loads(f.read_text(encoding="utf-8"))["token"], "theirs")   # untouched
-
-    def test_lock_from_another_machine_is_not_touched(self):
-        (self.dir / LOCK_NAME).write_text(json.dumps({"pid": 1, "host": "some-other-host", "token": "x"}), encoding="utf-8")
-        with self.assertRaises(SessionLocked):
-            SessionLock(self.dir).acquire()
-
-    def test_fresh_unreadable_lock_is_not_stolen_but_old_garbage_is(self):
-        f = self.dir / LOCK_NAME
-        f.write_text("", encoding="utf-8")                               # being written right now
-        with self.assertRaises(SessionLocked):
-            SessionLock(self.dir).acquire()
-        os.utime(f, (time.time() - 600, time.time() - 600))              # abandoned half-write
-        lk = SessionLock(self.dir)
-        lk.acquire()
-        lk.release()
-
-    def test_release_does_not_delete_a_lock_someone_else_now_owns(self):
+    def test_lock_file_is_never_deleted_by_release_or_takeover(self):
         a = SessionLock(self.dir)
         a.acquire()
-        (self.dir / LOCK_NAME).write_text(json.dumps({"pid": os.getpid(), "host": "x", "token": "other"}), encoding="utf-8")
         a.release()
-        self.assertTrue((self.dir / LOCK_NAME).exists())
+        self.assertTrue((self.dir / LOCK_NAME).exists())             # nobody unlinks it, so nobody can unlink a foreign one
+        b = SessionLock(self.dir)
+        b.acquire()
+        inode = (self.dir / LOCK_NAME).stat().st_ino
+        b.release()
+        self.assertEqual((self.dir / LOCK_NAME).stat().st_ino, inode)
 
-    def test_heartbeat_touches_the_file(self):
+    def test_release_of_a_lock_we_do_not_hold_touches_nothing(self):
+        a, stranger = SessionLock(self.dir), SessionLock(self.dir)
+        a.acquire()
+        info = a.read()
+        stranger.release()                                           # never acquired
+        with self.assertRaises(SessionLocked):
+            stranger.acquire()                                       # refused ...
+        stranger.release()                                           # ... and releasing the refused attempt is harmless
+        self.assertEqual(a.read(), info)                             # owner info intact
+        with self.assertRaises(SessionLocked):
+            SessionLock(self.dir).acquire()                          # a still holds it
+        a.release()
+        a.release()                                                  # double release is a no-op
+
+    def test_same_process_cannot_take_it_twice(self):
         a = SessionLock(self.dir)
         a.acquire()
-        old = time.time() - 500
-        os.utime(self.dir / LOCK_NAME, (old, old))
-        a.heartbeat()
-        self.assertGreater((self.dir / LOCK_NAME).stat().st_mtime, old + 400)
+        with self.assertRaises(SessionLocked):
+            a.acquire()
         a.release()
 
-    @unittest.skipUnless(os.name == "nt", "Windows-only: real OpenProcess/GetExitCodeProcess path")
-    def test_windows_pid_alive_does_not_kill_anything(self):
-        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    def test_owner_info_is_readable_while_locked_and_cleared_after(self):
+        a = SessionLock(self.dir)
+        a.acquire()
+        info = SessionLock(self.dir).read()
+        self.assertEqual((info["pid"], info["token"]), (os.getpid(), a.token))
+        a.release()
+        self.assertIsNone(SessionLock(self.dir).read())
+
+    def test_killed_owner_leaves_no_stale_lock(self):
+        procs, done = spawn_workers(self.dir, 1, self.dir, hold_sec=60)
+        out = procs[0].stdout.readline().strip()
+        self.assertEqual(out, "WON")
+        self.assertTrue(SessionLock.is_locked(self.dir))
+        procs[0].kill()                                              # hard kill: no release code runs
+        reap(procs)
+        self.assertFalse(SessionLock.is_locked(self.dir))            # the OS dropped the lock with the process
+        a = SessionLock(self.dir)
+        a.acquire()                                                  # the leftover text is just ignored
+        a.release()
+
+    def test_exactly_one_of_many_simultaneous_processes_wins_a_fresh_lock(self):
+        for rnd in range(3):
+            d = self.dir / f"fresh{rnd}"
+            d.mkdir()
+            procs, done = spawn_workers(d, 8, self.dir)
+            outs = []
+            for p in procs:
+                outs.append(p.stdout.readline().strip())
+            done.write_text("done")
+            reap(procs)
+            self.assertEqual(outs.count("WON"), 1, (rnd, outs))
+            self.assertEqual(outs.count("LOST"), 7, (rnd, outs))
+
+    def test_exactly_one_wins_when_the_previous_owner_just_died(self):
+        """The former takeover race: several processes meet a dead owner's leftovers at the same moment."""
+        for rnd in range(3):
+            d = self.dir / f"stale{rnd}"
+            d.mkdir()
+            dead = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            (d / LOCK_NAME).write_text(json.dumps({"pid": dead.pid, "host": __import__("socket").gethostname(),
+                                                   "token": "old", "created": 1}), encoding="utf-8")
+            os.utime(d / LOCK_NAME, (1, 1))
+            procs, done = spawn_workers(d, 8, self.dir)
+            outs = [p.stdout.readline().strip() for p in procs]
+            done.write_text("done")
+            reap(procs)
+            self.assertEqual(outs.count("WON"), 1, (rnd, outs))
+
+    def test_a_loser_never_disturbs_the_winner(self):
+        procs, done = spawn_workers(self.dir, 4, self.dir, hold_sec=30)
+        outs = [p.stdout.readline().strip() for p in procs]
+        self.assertEqual(outs.count("WON"), 1)
+        winner = procs[outs.index("WON")]
+        self.assertIsNone(winner.poll())
+        self.assertTrue(SessionLock.is_locked(self.dir))
+        info = SessionLock(self.dir).read()
+        self.assertEqual(info["pid"], winner.pid)                    # losers neither deleted nor rewrote the owner's info
+        done.write_text("done")
+        reap(procs)
+        self.assertFalse(SessionLock.is_locked(self.dir))
+
+    def test_is_locked_creates_nothing(self):
+        d = self.dir / "never"
+        d.mkdir()
+        self.assertFalse(SessionLock.is_locked(d))
+        self.assertFalse((d / LOCK_NAME).exists())
+
+
+class TestSessionIdValidation(unittest.TestCase):
+    BAD = ["..", ".", "../x", "..\\x", "a/b", "a\\b", "/etc/passwd", "\\\\server\\share", "C:\\Windows", "C:", "c:x",
+           "", " ", " abc", "abc ", "a b", "x\x00y", "a" * 101, "con.", ".hidden", "-rf", "é", "a:b", "a*b", "a?b", "~", "$HOME"]
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="agent sessions "))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.sessions = self.root / "sessions"
+        self.sessions.mkdir()
+
+    def test_bad_ids_are_refused_without_touching_the_disk(self):
+        from agent.store import safe_session_dir
+        for bad in self.BAD:
+            with self.assertRaises(StoreError, msg=repr(bad)):
+                safe_session_dir(self.sessions, bad)
+            with self.assertRaises(StoreError, msg=repr(bad)):
+                Store.open_existing(self.sessions, bad)
+        self.assertEqual(list(self.root.iterdir()), [self.sessions])
+        self.assertEqual(list(self.sessions.iterdir()), [])
+
+    def test_normal_ids_pass(self):
+        from agent.store import safe_session_dir
+        for ok in ("20261028-131316-be0f76", "abc", "A_b-1"):
+            self.assertEqual(safe_session_dir(self.sessions, ok), self.sessions / ok)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "needs symlinks")
+    def test_a_link_leading_outside_the_sessions_folder_is_refused(self):
+        from agent.store import safe_session_dir
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "state.json").write_text("{}", encoding="utf-8")
         try:
-            self.assertTrue(pid_alive(p.pid))
-            self.assertIsNone(p.poll())                                  # still running after the probe
-        finally:
-            p.kill()
-            p.wait()
-        self.assertFalse(pid_alive(p.pid))
-        self.assertTrue(pid_alive(os.getpid()))
+            os.symlink(outside, self.sessions / "linked", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot create a symlink here")
+        with self.assertRaises(StoreError):
+            safe_session_dir(self.sessions, "linked")
+        with self.assertRaises(StoreError):
+            Store.open_existing(self.sessions, "linked")
 
 
 class TestCliCommands(unittest.TestCase):
@@ -420,7 +520,7 @@ class TestCliCommands(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         sid = self.only_session().name
         self.assertIn(f"agent resume {sid}", r.stdout)
-        self.assertFalse((self.only_session() / LOCK_NAME).exists())            # lock released on exit
+        self.assertFalse(SessionLock.is_locked(self.only_session()))            # lock released on exit
         r = self.run_agent(["sessions"])
         self.assertEqual(r.returncode, 0)
         self.assertIn(sid, r.stdout)
@@ -462,11 +562,35 @@ class TestCliCommands(unittest.TestCase):
                            text=True, encoding="utf-8", env=env, cwd=other, timeout=60)
         self.assertEqual(r.returncode, 2)
         self.assertIn("--here", r.stderr)
-        self.assertFalse((self.only_session() / LOCK_NAME).exists())            # refused resumes release their lock
+        self.assertFalse(SessionLock.is_locked(self.only_session()))            # refused resumes release their lock
         r = subprocess.run([sys.executable, "-m", "agent", "resume", sid, "--here"], input="/exit\n",
                            capture_output=True, text=True, encoding="utf-8", env=env, cwd=other, timeout=60)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("continuing here", r.stdout)
+
+    def test_resume_refuses_path_traversal_and_outside_targets_and_touches_nothing(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "state.json").write_text(json.dumps({"version": 2, "agents": {}}), encoding="utf-8")
+        (self.home / "sessions").mkdir(exist_ok=True)
+        before = sorted(p.name for p in self.tmp.rglob("*"))
+        for bad in ("../../outside", "..", "../outside", str(outside), "..\\..\\outside", "C:\\Windows", "a/b", "",
+                    "x" * 300, "bad id"):
+            r = self.run_agent(["resume", bad])
+            self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
+            self.assertIn("Cannot resume", r.stderr, bad)
+            self.assertNotIn("Traceback", r.stderr, bad)
+        self.assertFalse((outside / LOCK_NAME).exists())                        # no lock file was created out there
+        self.assertEqual(sorted(p.name for p in self.tmp.rglob("*")), before)    # nothing at all was created anywhere
+        self.assertEqual(json.loads((outside / "state.json").read_text(encoding="utf-8")),
+                         {"version": 2, "agents": {}})                           # and nothing rewritten
+
+    def test_a_normal_session_id_still_resumes(self):
+        self.run_agent([], "hi\n/exit\n", {"manager": [M([final("ok")]), M([final("again")])], "w1": []})
+        sid = self.only_session().name
+        r = self.run_agent(["resume", sid], "more\n/exit\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Manager> @Me again", r.stdout)
 
     def test_resume_refuses_when_config_changed_the_cli_of_an_agent(self):
         self.run_agent([], "hi\n/exit\n", {"manager": [M([final("ok")])], "w1": []})

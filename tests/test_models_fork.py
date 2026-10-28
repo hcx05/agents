@@ -5,6 +5,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -365,30 +366,115 @@ class TestSessionIdGuardsAndFork(unittest.TestCase):
         runner.check_shim_args(inv.args)                                       # no character cmd.exe would reinterpret
 
 
+class SpyAdapter:
+    """Stands in for ClaudeAdapter in probe tests: records every request, fails the test if it is called when it must not be."""
+
+    def __init__(self, replies=()):
+        self.replies = list(replies)
+        self.requests = []
+
+    def run(self, req, cancel, on_session, on_raw=None):
+        from agent.adapters.base import TurnResult
+        self.requests.append(req)
+        if not self.replies:
+            raise AssertionError("the probe must not call the CLI here")
+        kind, sid, text = self.replies.pop(0)
+        if sid:
+            on_session(sid)
+        return TurnResult(True, text=text, session_id=sid or req.session_id, mode="spy")
+
+
 class TestProbeHelpers(unittest.TestCase):
-    def test_transcript_lookup_and_fingerprint_are_read_only(self):
+    ORIG = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
         import probe
-        tmp = Path(tempfile.mkdtemp(prefix="agent cfgdir "))
-        self.addCleanup(shutil.rmtree, tmp, True)
-        proj = tmp / "projects" / "-some-project"
-        proj.mkdir(parents=True)
-        f = proj / "abc.jsonl"
-        f.write_bytes(b'{"x":1}\n')
-        old = os.environ.get("CLAUDE_CONFIG_DIR")
-        os.environ["CLAUDE_CONFIG_DIR"] = str(tmp)
-        try:
-            self.assertEqual(probe.find_transcript("abc"), f)
-            self.assertIsNone(probe.find_transcript("missing"))
-            (tmp / "projects" / "-other").mkdir()
-            (tmp / "projects" / "-other" / "abc.jsonl").write_bytes(b"dup")      # duplicate copy -> ambiguous -> not used
-            self.assertIsNone(probe.find_transcript("abc"))
-        finally:
-            if old is None:
-                os.environ.pop("CLAUDE_CONFIG_DIR", None)
-            else:
-                os.environ["CLAUDE_CONFIG_DIR"] = old
-        self.assertEqual(probe.file_fingerprint(f)[0], 8)
+        from unittest import mock
+        self.probe = probe
+        self.tmp = Path(tempfile.mkdtemp(prefix="agent cfgdir "))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.tmp)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)            # this suite may itself run inside a Claude Code shell
+        probe.RESULTS.clear()
+        probe.OPTS.update(session_id=None, confirm_fork=False)
+        self.proj = self.tmp / "projects" / "-some-project"
+        self.proj.mkdir(parents=True)
+        self.transcript = self.proj / f"{self.ORIG}.jsonl"
+        self.transcript.write_bytes(b'{"entrypoint":"cli","type":"user"}\n')
+        old = time.time() - 3600
+        os.utime(self.transcript, (old, old))
+
+    def statuses(self):
+        return [(n, st) for n, st, _ in self.probe.RESULTS]
+
+    def test_transcript_lookup_and_fingerprint_are_read_only(self):
+        probe = self.probe
+        self.assertEqual(probe.find_transcript(self.ORIG), self.transcript)
+        self.assertIsNone(probe.find_transcript("missing"))
+        (self.tmp / "projects" / "-other").mkdir()
+        (self.tmp / "projects" / "-other" / f"{self.ORIG}.jsonl").write_bytes(b"dup")      # duplicate copy -> ambiguous
+        self.assertIsNone(probe.find_transcript(self.ORIG))
+        self.assertEqual(probe.file_fingerprint(self.transcript)[0], len(file_bytes(self.transcript)))
         self.assertIsNone(probe.file_fingerprint(None))
+        self.assertEqual(probe.transcript_entrypoint(self.transcript), "cli")
+
+    def test_inside_a_claude_code_shell_both_experiments_stop_before_any_cli_call(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "abc"}):
+            self.assertIn("CLAUDE_CODE_SESSION_ID", self.probe.fork_blocker())
+            spy = SpyAdapter()
+            self.probe.OPTS.update(session_id=self.ORIG, confirm_fork=True)       # even with every flag given
+            self.probe.probe_fork_headless(spy, ["claude"], str(self.tmp))
+            self.probe.probe_fork_interactive(spy, ["claude"], str(self.tmp))
+        self.assertEqual(spy.requests, [])
+        self.assertEqual([st for _, st in self.statuses()], ["STOPPED", "STOPPED"])
+        self.assertEqual(file_bytes(self.transcript), b'{"entrypoint":"cli","type":"user"}\n')
+        self.assertIsNone(self.probe.fork_blocker())
+
+    def test_interactive_experiment_refuses_unsafe_or_unconfirmed_input(self):
+        probe = self.probe
+        spy = SpyAdapter()
+        for opts, needle in ((dict(session_id=None), "--session-id"), (dict(session_id="not-a-uuid"), "--session-id"),
+                             (dict(session_id="99999999-2222-3333-4444-555555555555"), "no single transcript"),
+                             (dict(session_id=self.ORIG, confirm_fork=False), "--confirm-fork")):
+            probe.RESULTS.clear()
+            probe.OPTS.update(session_id=None, confirm_fork=False)
+            probe.OPTS.update(opts)
+            probe.probe_fork_interactive(spy, ["claude"], str(self.tmp))
+            self.assertEqual([st for _, st in self.statuses()], ["STOPPED"], opts)
+            self.assertIn(needle, probe.RESULTS[0][2], opts)
+        probe.RESULTS.clear()
+        os.utime(self.transcript, None)                                            # "still being written by a live window"
+        probe.OPTS.update(session_id=self.ORIG, confirm_fork=True)
+        probe.probe_fork_interactive(spy, ["claude"], str(self.tmp))
+        self.assertEqual([st for _, st in self.statuses()], ["STOPPED"])
+        self.assertIn("/exit", probe.RESULTS[0][2])
+        self.assertEqual(spy.requests, [])
+
+    def test_confirmed_interactive_experiment_only_forks_and_never_writes_the_original(self):
+        probe = self.probe
+        before = file_bytes(self.transcript)
+        final_ok = json.dumps({"say": "", "actions": [{"type": "final", "text": "我們在整理專案"}]})
+        dispatch_ok = json.dumps({"say": "", "actions": [{"type": "dispatch", "to": "w1", "task_id": "t1", "text": "say hi",
+                                                          "writes": [], "model": None, "effort": None}]})
+        spy = SpyAdapter([("fork", "FORK-ID", final_ok), ("resume", None, dispatch_ok)])
+        probe.OPTS.update(session_id=self.ORIG, confirm_fork=True)
+        probe.probe_fork_interactive(spy, ["claude"], str(self.tmp))
+        self.assertEqual([(r.session_id, r.fork) for r in spy.requests], [(self.ORIG, True), ("FORK-ID", False)])
+        self.assertNotIn("FAIL", [st for _, st in self.statuses()], self.probe.RESULTS)
+        self.assertIn(("fork-interactive: Manager JSON protocol obeyed after fork", "PASS"), self.statuses())
+        self.assertIn(("fork-interactive: forked Manager can dispatch to the configured worker", "PASS"), self.statuses())
+        self.assertEqual(file_bytes(self.transcript), before)
+
+    def test_headless_experiment_is_labelled_as_not_proof_for_interactive_sessions(self):
+        self.assertIn("NOT", self.probe.probe_fork_headless.__doc__.upper().replace("NOTHING", "NOT"))
+        self.assertIn("fork-interactive", self.probe.probe_fork_headless.__doc__)
+
+
+def file_bytes(path):
+    return Path(path).read_bytes()
 
 
 if __name__ == "__main__":

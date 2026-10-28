@@ -14,7 +14,7 @@ from .config import ConfigError, config_path, ensure_config, home_dir, load_conf
 from .orchestrator import Engine
 from .resume import check_compat, format_sessions, replay, timeline
 from .sessionlock import SessionLock, SessionLocked
-from .store import Store, StoreError
+from .store import Store, StoreError, safe_session_dir
 from .ui import ChatUI, RecordingUI
 
 HELP_IN_CHAT = "Commands: /status  /interrupt  /exit.  Anything else is sent to the Manager."
@@ -79,6 +79,16 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 def _run_chat(args: argparse.Namespace, resume_id: Optional[str]) -> int:
+    resume_dir: Optional[Path] = None
+    if resume_id is not None:
+        try:
+            resume_dir = safe_session_dir(home_dir() / "sessions", resume_id)      # before ANY file access
+        except StoreError as e:
+            print(f"Cannot resume: {e}", file=sys.stderr)
+            return 2
+        if not (resume_dir / "state.json").is_file():
+            print(f"Session {resume_id!r} not found. `agent sessions` lists the saved ones.", file=sys.stderr)
+            return 2
     path = Path(args.config) if args.config else None
     try:
         cfg = load_config(path)
@@ -86,9 +96,6 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str]) -> int:
         print(f"Config error: {e}", file=sys.stderr)
         return 2
     cwd = os.getcwd()
-    if resume_id is not None and not (home_dir() / "sessions" / resume_id / "state.json").is_file():
-        print(f"Session {resume_id!r} not found. `agent sessions` lists the saved ones.", file=sys.stderr)
-        return 2
     adapters = {}
     problems = []
     for aid, ac in cfg.agents.items():
@@ -106,10 +113,7 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str]) -> int:
     root = home_dir() / "sessions"
     resumed = resume_id is not None
     if resumed:
-        if not (root / resume_id / "state.json").is_file():
-            print(f"Session {resume_id!r} not found. `agent sessions` lists the saved ones.", file=sys.stderr)
-            return 2
-        lock = SessionLock(root / resume_id)
+        lock = SessionLock(resume_dir)
         try:
             lock.acquire()                       # before reading the state: only one writer per session
         except SessionLocked as e:
@@ -142,7 +146,6 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str]) -> int:
     except Exception:
         lock.release()
         raise
-    engine.on_tick = lock.heartbeat
     engine.start()
     mgr = cfg.agents[cfg.manager]
     ui.banner(["Agent Team",

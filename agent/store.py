@@ -60,6 +60,26 @@ class StoreError(Exception):
     pass
 
 
+# Session ids this program creates look like 20261028-131316-be0f76. Anything else - separators, dots, drive letters,
+# NUL, whitespace, over-long text - is refused before it can reach the file system.
+SESSION_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{0,99}$")
+
+
+def safe_session_dir(sessions_root: Path, session_id: str) -> Path:
+    """`sessions_root/session_id`, guaranteed to be a direct child of sessions_root. Raises StoreError otherwise
+    (path traversal, absolute paths, drive letters, odd characters, or a symlink/junction leading outside)."""
+    if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
+        raise StoreError(f"invalid session id {session_id!r}: use an id from `agent sessions`")
+    root = Path(sessions_root)
+    target = root / session_id
+    try:
+        if target.resolve().parent != root.resolve():
+            raise StoreError(f"session id {session_id!r} does not point inside the sessions folder")
+    except OSError as e:
+        raise StoreError(f"session id {session_id!r} cannot be resolved: {e}")
+    return target
+
+
 class Store:
     def __init__(self, sessions_root: Path, session_id: Optional[str] = None, state: Optional[Dict[str, Any]] = None):
         self.id = session_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
@@ -81,7 +101,7 @@ class Store:
     def open_existing(cls, sessions_root: Path, session_id: str) -> "Store":
         """Open a saved session for resuming. Old (version 1) states are upgraded in memory; nothing is written
         until the engine saves. A damaged state.json or a half-written last event line never raises past StoreError."""
-        d = Path(sessions_root) / session_id
+        d = safe_session_dir(Path(sessions_root), session_id)
         if not (d / "state.json").is_file():
             raise StoreError(f"session {session_id!r} not found under {sessions_root}")
         try:
@@ -178,7 +198,7 @@ class Store:
     @staticmethod
     def summaries(sessions_root: Path) -> List[Dict[str, Any]]:
         """One dict per saved session (oldest first) for `agent sessions`. Damaged sessions are listed, not fatal."""
-        from .sessionlock import LOCK_NAME, SessionLock
+        from .sessionlock import SessionLock
         out: List[Dict[str, Any]] = []
         for sid in Store.list_sessions(sessions_root):
             d = Path(sessions_root) / sid
@@ -191,13 +211,7 @@ class Store:
                            agents="+".join(str(a.get("cli", "?")) for a in (st.get("agents") or {}).values()))
             except (OSError, ValueError, AttributeError):
                 row["ok"] = False
-            if (d / LOCK_NAME).exists():
-                lk = SessionLock(d).read()
-                try:
-                    from .sessionlock import pid_alive
-                    row["locked"] = bool(lk and isinstance(lk.get("pid"), int) and pid_alive(lk["pid"]))
-                except Exception:
-                    row["locked"] = False
+            row["locked"] = SessionLock.is_locked(d)
             for rec in Store.iter_events(d):
                 if rec.get("type") == "chat" and rec.get("sender") == "Me":
                     row["first"] = str(rec.get("text", "")).replace("\n", " ")[:50]
