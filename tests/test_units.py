@@ -254,11 +254,26 @@ class TestAdaptersBuild(unittest.TestCase):
         self.assertTrue(res.denials)
 
 
+def su(step_type, conv="conv-1", **inner):
+    """Official nested step_update event: step fields live under the inner "step_update" object."""
+    body = {"conversation_id": conv, "step_type": step_type}
+    body.update(inner)
+    return json.dumps({"event": "step_update", "step_update": body})
+
+
+def delta(text, conv="conv-1"):
+    return su("agent_response", conv, text_delta=text)
+
+
+def result_ev(conv="conv-1", **fields):
+    return json.dumps({"event": "result", "result": dict({"conversation_id": conv}, **fields)})
+
+
 OFFICIAL_OK = [
     '{"event":"init","conversation_id":"conv-1"}',
-    '{"event":"step_update","step_type":"agent_response","text_delta":"{\\"status\\":"}',
-    '{"event":"step_update","step_type":"tool_call","text_delta":"IGNORE ME","tool_info":{"name":"ls"}}',
-    '{"event":"step_update","step_type":"agent_response","text_delta":" \\"done\\"}"}',
+    delta('{"status":'),
+    su("tool_call", text_delta="IGNORE ME", tool_info={"name": "ls"}),
+    delta(' "done"}'),
     '{"event":"result","result":{"conversation_id":"conv-1","status":"SUCCESS","response":"{\\"status\\": \\"done\\"}"}}',
 ]
 
@@ -290,8 +305,7 @@ class TestAgyOfficialParser(unittest.TestCase):
 
     def test_text_deltas_concatenate_without_inserted_newlines(self):
         lines = ['{"event":"init","conversation_id":"c"}'] + [
-            json.dumps({"event": "step_update", "step_type": "agent_response", "text_delta": d})
-            for d in ['{"a":', ' "he', 'llo wor', 'ld"}']] + [
+            delta(d, "c") for d in ['{"a":', ' "he', 'llo wor', 'ld"}']] + [
             '{"event":"result","result":{"conversation_id":"c","status":"SUCCESS"}}']
         res, _ = agy_parse(lines)                                  # no response -> deltas are the fallback
         self.assertTrue(res.ok, res.error)
@@ -300,8 +314,8 @@ class TestAgyOfficialParser(unittest.TestCase):
 
     def test_non_agent_response_steps_are_ignored(self):
         lines = ['{"event":"init","conversation_id":"c"}',
-                 '{"event":"step_update","step_type":"tool_output","text_delta":"SECRET TOOL OUTPUT"}',
-                 '{"event":"step_update","step_type":"usage","text_delta":"tokens=5"}',
+                 su("tool_output", "c", text_delta="SECRET TOOL OUTPUT"),
+                 su("usage", "c", text_delta="tokens=5"),
                  '{"event":"result","result":{"conversation_id":"c","status":"SUCCESS"}}']
         res, _ = agy_parse(lines)
         self.assertFalse(res.ok)                                   # nothing from the assistant -> not success
@@ -348,7 +362,7 @@ class TestAgyOfficialParser(unittest.TestCase):
         self.assertEqual(res.error_kind, "exit")
 
     def test_session_id_sources_and_no_overwrite(self):
-        res, seen = agy_parse(['{"event":"step_update","step_type":"agent_response","text_delta":"x","conversation_id":"from-step"}',
+        res, seen = agy_parse([delta("x", "from-step"),
                                '{"event":"result","result":{"conversation_id":"from-result","status":"SUCCESS","response":"x"}}'])
         self.assertEqual(res.session_id, "from-step")              # first id wins, later metadata can't overwrite
         self.assertEqual(seen, ["from-step"])
@@ -426,6 +440,96 @@ class TestAgyEffortAndErrors(unittest.TestCase):
             self.assertIn(err, res.error)                           # the real CLI message is passed on
 
 
+class TestAgyNestedStepUpdate(unittest.TestCase):
+    """Official layout: {"event":"step_update","step_update":{...}} (https://antigravity.google/docs/cli/headless/)."""
+
+    def test_A_streaming_fallback_when_result_response_missing(self):
+        lines = ['{"event":"init","conversation_id":"c"}'] + [
+            delta(d, "c") for d in ['{"status": "do', 'ne", "task_id"', ': "t1", "text": "x",', ' "files_touched": []}']
+        ] + [result_ev("c", status="SUCCESS")]
+        res, _ = agy_parse(lines)
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(res.text, '{"status": "done", "task_id": "t1", "text": "x", "files_touched": []}')
+        self.assertEqual(protocol.extract_json(res.text)[0]["task_id"], "t1")
+        self.assertNotIn("\n", res.text)
+
+    def test_A2_terminal_response_wins_over_deltas_no_mixing(self):
+        lines = ['{"event":"init","conversation_id":"c"}', delta("PARTIAL ", "c"), delta("DELTAS", "c"),
+                 result_ev("c", status="SUCCESS", response="FINAL")]
+        res, _ = agy_parse(lines)
+        self.assertEqual(res.text, "FINAL")
+
+    def test_B_nested_tool_info_policy_denial_with_success_exit0_no_stderr(self):
+        lines = ['{"event":"init","conversation_id":"c"}',
+                 su("tool_call", "c", tool_info={"name": "write_file", "error": "Tool call denied by policy: requires approval"}),
+                 delta('{"status":"done"}', "c"), result_ev("c", status="SUCCESS")]
+        res, _ = agy_parse(lines, stderr=[], exit_code=0)
+        self.assertTrue(res.ok)
+        self.assertEqual(len(res.denials), 1)
+        self.assertIn("write_file", res.denials[0])
+        self.assertIn("denied by policy", res.denials[0])
+
+    def test_B2_denial_evidence_downgrades_worker_done_to_blocked(self):
+        # end-to-end through the real Engine: nested tool_info denial + worker claims done -> task blocked
+        from tests.rig import Rig, M, W, dispatch, final
+        rig = Rig({"manager": [M([dispatch("w1", "t1", "寫檔")]), M([final("被擋住了")])],
+                   "w1": [W("done", "t1", "完成了！", denial=[{"tool_name": "write_file", "tool_input": {}}])]})
+        try:
+            # swap the fake worker for fake_agy so the denial comes from agy's nested tool_info.error
+            scen = Path(rig.tmp) / "agy.log"
+            os.environ["FAKE_AGY_LOG"] = str(scen)
+            os.environ["FAKE_AGY_MODE"] = "tool_denial_done"
+            from agent.config import AgentCfg as AC
+            from agent.adapters.agy import AgyAdapter as AA
+            rig.engine.agents["w1"].adapter = AA(AC("w1", "worker", "agy",
+                                                    command=str(Path(__file__).with_name("fake_agy.py"))))
+            rig.say("go")
+            self.assertEqual(rig.store.state["tasks"]["t1"]["status"], "blocked")
+            p = rig.calls("manager")[1]["prompt"]
+            self.assertIn("status blocked", p)
+            self.assertIn("write_file", p)
+            self.assertIn("denied by policy", p)
+        finally:
+            os.environ.pop("FAKE_AGY_MODE", None)
+            rig.close()
+
+    def test_C_ordinary_tool_errors_are_not_policy_denials(self):
+        lines = ['{"event":"init","conversation_id":"c"}']
+        for err in ("ENOENT: no such file or directory, open 'x'", "EACCES: permission denied, open 'y'",
+                    "EPERM: operation not permitted", "command exited with code 1"):
+            lines.append(su("tool_call", "c", tool_info={"name": "t", "error": err}))
+        lines.append(result_ev("c", status="SUCCESS", response="r"))
+        res, _ = agy_parse(lines, stderr=[], exit_code=0)
+        self.assertEqual(res.denials, [])
+
+    def test_D_inner_conversation_id_is_read_and_guarded(self):
+        lines = [delta("x", "inner-id"), result_ev(status="SUCCESS", response="x", conv="inner-id")]
+        res, seen = agy_parse(lines)
+        self.assertEqual((res.session_id, seen), ("inner-id", ["inner-id"]))
+        res, seen = agy_parse(lines, session_id="inner-id")
+        self.assertTrue(res.ok)
+        self.assertEqual(seen, [])
+        res, seen = agy_parse([delta("x", "OTHER"), result_ev(status="SUCCESS", response="x", conv="OTHER")],
+                              session_id="inner-id")
+        self.assertEqual(res.error_kind, "session_lost")
+        self.assertEqual((res.session_id, seen), ("inner-id", []))
+
+    def test_inner_object_wins_over_stray_outer_fields(self):
+        ev = json.dumps({"event": "step_update", "step_type": "agent_response", "text_delta": "OUTER",
+                         "step_update": {"step_type": "agent_response", "text_delta": "INNER"}})
+        res, _ = agy_parse(['{"event":"init","conversation_id":"c"}', ev, result_ev("c", status="SUCCESS")])
+        self.assertEqual(res.text, "INNER")
+
+    def test_legacy_flat_step_update_still_accepted(self):   # LEGACY layout, not the official one
+        lines = ['{"event":"init","conversation_id":"c"}',
+                 '{"event":"step_update","step_type":"agent_response","text_delta":"flat"}',
+                 '{"event":"step_update","step_type":"tool_call","tool_info":{"name":"w","error":"auto-denied"}}',
+                 result_ev("c", status="SUCCESS")]
+        res, _ = agy_parse(lines)
+        self.assertEqual(res.text, "flat")
+        self.assertEqual(len(res.denials), 1)
+
+
 class TestAgyDenials(unittest.TestCase):
     def test_soft_denial_on_stderr_with_exit_zero(self):
         res, _ = agy_parse(OFFICIAL_OK, stderr=["tool run_command auto-denied in headless mode (soft denial)"], exit_code=0)
@@ -435,7 +539,7 @@ class TestAgyDenials(unittest.TestCase):
 
     def test_tool_info_error_with_denial_evidence(self):
         lines = ['{"event":"init","conversation_id":"c"}',
-                 '{"event":"step_update","step_type":"tool_call","tool_info":{"name":"write_file","error":"Tool call denied by policy: requires approval"}}',
+                 su("tool_call", "c", tool_info={"name": "write_file", "error": "Tool call denied by policy: requires approval"}),
                  '{"event":"result","result":{"conversation_id":"c","status":"SUCCESS","response":"claimed done"}}']
         res, _ = agy_parse(lines)
         self.assertTrue(res.ok)
@@ -444,11 +548,38 @@ class TestAgyDenials(unittest.TestCase):
 
     def test_ordinary_tool_errors_are_not_denials(self):
         lines = ['{"event":"init","conversation_id":"c"}',
-                 '{"event":"step_update","step_type":"tool_call","tool_info":{"name":"read_file","error":"ENOENT: no such file"}}',
-                 '{"event":"step_update","step_type":"tool_call","tool_info":{"name":"read_file","error":"EACCES: permission denied, open x"}}',
+                 su("tool_call", "c", tool_info={"name": "read_file", "error": "ENOENT: no such file"}),
+                 su("tool_call", "c", tool_info={"name": "read_file", "error": "EACCES: permission denied, open x"}),
                  '{"event":"result","result":{"conversation_id":"c","status":"SUCCESS","response":"r"}}']
         res, _ = agy_parse(lines, stderr=["warn: operation not permitted on socket", "retrying after timeout"])
         self.assertEqual(res.denials, [])
+
+
+class TestAgyErrorClassification(unittest.TestCase):
+    CASES = [
+        ('Invalid effort "turbo" (valid: low, medium, high, xhigh, max)', "effort_invalid"),
+        ('Model has no "max" effort (available: low, medium, high)', "effort_invalid"),
+        ("effort isn't adjustable for the current model", "effort_invalid"),
+        ('invalid model selection (--model "does-not-exist-model" --effort ""): model does-not-exist-model is not recognized',
+         "model_invalid"),
+        ('invalid model selection (--model "gem" --effort "max"): Model has no "max" effort', "effort_invalid"),
+        ("Unknown model: nope", "model_invalid"),
+        ("backend exploded", "cli_error"),
+    ]
+
+    def test_classify_error_table(self):
+        from agent.adapters.agy import classify_error
+        for text, kind in self.CASES:
+            self.assertEqual(classify_error(text), kind, text)
+
+    def test_from_stderr_and_from_result_error_keep_real_message(self):
+        for text, kind in self.CASES:
+            res, _ = agy_parse([], stderr=["error: " + text], exit_code=2)          # stderr, no events
+            self.assertEqual(res.error_kind, "exit" if kind == "cli_error" else kind, ("stderr", text))
+            res, _ = agy_parse(['{"event":"init","conversation_id":"c"}',
+                                result_ev("c", status="ERROR", error=text)])         # result.error
+            self.assertEqual(res.error_kind, kind, ("result.error", text))
+            self.assertIn(text, res.error)                                           # message reaches the Manager
 
 
 class TestAgyViaSubprocess(unittest.TestCase):
@@ -504,6 +635,26 @@ class TestAgyViaSubprocess(unittest.TestCase):
                                       model="m" if "model" in mode else None)
             self.assertFalse(res.ok, mode)
             self.assertEqual(res.error_kind, kind, mode + str(res.error))
+
+    def test_nested_events_parse_through_real_subprocess(self):
+        raw = Path(__file__).with_name("fake_agy.py").read_text(encoding="utf-8")
+        self.assertIn('"step_update": {"conversation_id"', raw)      # fixture really emits the nested layout
+        res, saved, _ = self.run_turn("no_response")                  # SUCCESS w/o response -> nested deltas used
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(json.loads(res.text)["task_id"], "t1")
+        self.assertEqual(saved, ["conv-new-1"])
+
+    def test_nested_tool_denial_through_subprocess(self):
+        res, _, _ = self.run_turn("tool_denial")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.exit_code, 0)
+        self.assertEqual(len(res.denials), 1)
+        self.assertIn("denied by policy", res.denials[0])
+
+    def test_nested_ordinary_tool_errors_through_subprocess(self):
+        res, _, _ = self.run_turn("tool_error")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.denials, [])
 
     def test_stderr_soft_denial_with_success(self):
         res, _, _ = self.run_turn("denial_stderr")

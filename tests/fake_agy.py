@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake `agy` emitting the official stream-json shape (init -> step_update -> result).
+"""Fake `agy` emitting the official stream-json shape (init -> step_update{step_update:{...}} -> result).
 Behaviour via env FAKE_AGY_MODE; argv logged as JSON lines to FAKE_AGY_LOG."""
 import json
 import os
@@ -37,8 +37,21 @@ out({"event": "init", "conversation_id": conv})
 if mode == "denial_stderr":
     sys.stderr.write("tool run_command auto-denied in headless mode (soft denial)\n")
 for part in (reply[:10], reply[10:]):
-    out({"event": "step_update", "step_type": "agent_response", "text_delta": part})
+    out({"event": "step_update", "step_update": {"conversation_id": conv, "step_type": "agent_response",
+                                                 "text_delta": part}})
+if mode in ("tool_denial", "tool_denial_done"):      # denial only inside nested tool_info.error; nothing on stderr; result SUCCESS
+    out({"event": "step_update", "step_update": {"conversation_id": conv, "step_type": "tool_call",
+                                                 "tool_info": {"name": "write_file",
+                                                               "error": "Tool call denied by policy: requires approval"}}})
+if mode == "tool_error":
+    out({"event": "step_update", "step_update": {"conversation_id": conv, "step_type": "tool_call",
+                                                 "tool_info": {"name": "read_file", "error": "ENOENT: no such file"}}})
+    out({"event": "step_update", "step_update": {"conversation_id": conv, "step_type": "tool_call",
+                                                 "tool_info": {"name": "read_file", "error": "EACCES: permission denied"}}})
 if mode == "no_result":
+    sys.exit(0)
+if mode == "no_response":      # SUCCESS without result.response -> parser must use the streamed deltas
+    out({"event": "result", "result": {"conversation_id": conv, "status": "SUCCESS"}})
     sys.exit(0)
 if mode == "effort_err_result":
     out({"event": "result", "result": {"conversation_id": conv, "status": "ERROR",

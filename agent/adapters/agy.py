@@ -5,7 +5,7 @@ Facts taken from the product spec / official docs:
   * normal mode:  agy -p "<prompt>" --output-format stream-json [--conversation <id>]
   * stdin mode:   agy --input-format stream-json --output-format stream-json   (prompt ONLY via stdin as
                   {"event":"user","message":{"content":"..."}}; -p is ignored in this mode, so never mixed)
-Official stream-json events: init -> step_update (agent_response.text_delta) -> result{conversation_id,status,
+Official stream-json events: init -> step_update{step_update:{step_type,text_delta,tool_info}} -> result{conversation_id,status,
 response,structured_output?,error?}; only status SUCCESS is success. --effort <value> is passed through when set.
 Unverified (run `python probe.py agy` on Windows to check): whether --conversation / --json-schema work with
 stdin streaming, and exactly which stderr/tool_info texts agy uses for soft-denials.
@@ -34,12 +34,18 @@ DENIAL_RE = re.compile(
     r"|approval (is )?required|permission required"
     r"|(not|cannot be) (allowed|permitted|approved) in (headless|non-?interactive)"
     r"|headless.{0,40}(den|disallow|block))", re.I)
+# agy echoes its own flags inside errors, e.g. `invalid model selection (--model "x" --effort ""): ...`.
+# Those echoes say nothing about which value was bad, so they are removed before classifying.
+ECHOED_FLAG_RE = re.compile(r"--(?:effort|model)(?:\s+(?:\"[^\"]*\"|'[^']*'|[^\s)]+))?", re.I)
 EFFORT_ERR_RE = re.compile(
-    r"effort.{0,80}(invalid|unsupported|not support|unknown|unrecognized|must be|one of|supported values|not available)"
-    r"|(invalid|unsupported|unknown|unrecognized).{0,40}effort"
-    r"|(does not|doesn't) support.{0,40}effort", re.I)
+    r"(invalid|unknown|unsupported|unrecognized)\s+effort"
+    r"|\bhas no\b.{0,30}\beffort\b"
+    r"|\beffort\b.{0,40}(isn'?t|is not|cannot be|can'?t be|not)\s+(adjustable|changeable|configurable|supported|available|settable)"
+    r"|(does not|doesn'?t|do not) support.{0,40}\beffort\b"
+    r"|\beffort\b.{0,80}(unsupported|must be one of|\(valid:|\(available:)", re.I)
 MODEL_ERR_RE = re.compile(
-    r"(invalid|unknown|unsupported|unrecognized).{0,20}model|model.{0,30}(not (found|exist|available|supported)|invalid)", re.I)
+    r"(invalid|unknown|unsupported|unrecognized)\s+(\w+\s+)?model|model.{0,60}(not (found|exist|available|supported|recognized)|invalid)"
+    r"|is not recognized", re.I)
 SESSION_ERR_RE = re.compile(r"(conversation|session).{0,60}(not found|no such|unknown|does not exist|cannot be resumed)", re.I)
 ARGV_PROMPT_LIMIT = 6000  # stay far below Windows' 32k CreateProcess limit
 
@@ -73,9 +79,10 @@ def classify_error(text: str) -> str:
     ('model X does not support effort high' is an effort problem)."""
     if SESSION_ERR_RE.search(text):
         return "session_lost"
-    if EFFORT_ERR_RE.search(text):
+    core = ECHOED_FLAG_RE.sub(" ", text)
+    if EFFORT_ERR_RE.search(core):
         return "effort_invalid"
-    if MODEL_ERR_RE.search(text):
+    if MODEL_ERR_RE.search(core):
         return "model_invalid"
     return "cli_error"
 
@@ -148,13 +155,16 @@ class AgyParser(Parser):
     def _feed_official(self, name: str, ev: Dict[str, Any]) -> None:
         self.official = True
         res = ev.get("result") if isinstance(ev.get("result"), dict) else None
-        self._scan_session((ev, ev.get("data"), res))
-        if name == "step_update":
-            if ev.get("step_type") == "agent_response":
-                d = ev.get("text_delta")
+        # Official layout nests the step fields: {"event":"step_update","step_update":{step_type,text_delta,tool_info,...}}.
+        # Legacy flat layout (fields beside "event") is still accepted when no inner object exists.
+        inner = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else (ev if name == "step_update" else None)
+        self._scan_session((ev, inner, ev.get("data"), res))
+        if name == "step_update" and inner is not None:
+            if inner.get("step_type") == "agent_response":
+                d = inner.get("text_delta")
                 if isinstance(d, str):
                     self.deltas.append(d)            # raw concatenation: deltas carry their own whitespace
-            ti = ev.get("tool_info")
+            ti = inner.get("tool_info")
             if isinstance(ti, dict):
                 e = _err_text(ti.get("error"))
                 if e and DENIAL_RE.search(e):
