@@ -36,12 +36,14 @@ class TurnResult:
     session_id: Optional[str] = None
     error: Optional[str] = None
     # not_found|start_failed|timeout|cancelled|session_lost|model_invalid|effort_invalid|
-    # unsupported|cli_error|no_output|exit
+    # unsupported|cli_error|no_output|exit|unknown_format
+    # (unknown_format: the CLI's output no longer looks like what this adapter understands; never guessed at)
     error_kind: Optional[str] = None
     denials: List[str] = field(default_factory=list)
     exit_code: Optional[int] = None
     mode: str = ""
     killed_with: Optional[str] = None
+    notes: List[str] = field(default_factory=list)   # harmless oddities seen (unfamiliar event types...); logged only
 
 
 class Parser:
@@ -52,6 +54,9 @@ class Parser:
 
     def finish(self, proc: runner.ProcResult) -> TurnResult:
         raise NotImplementedError
+
+    def diagnostics(self) -> List[str]:
+        return []
 
 
 class Adapter:
@@ -76,6 +81,10 @@ class Adapter:
         raise NotImplementedError
 
     # ---- shared
+    def version_args_supported(self) -> bool:
+        """True when `<cmd> --version` is a real, free, official call (not the test fake)."""
+        return True
+
     def check_available(self) -> Optional[str]:
         try:
             self.command_prefix()
@@ -120,6 +129,7 @@ class Adapter:
         if proc.status == "start_failed":
             return TurnResult(False, error=f"could not start CLI: {proc.start_error}", error_kind="start_failed")
         res = parser.finish(proc)
+        res.notes = parser.diagnostics()
         res.exit_code = proc.exit_code
         if proc.status == "timeout":
             res.ok, res.error_kind = False, "timeout"

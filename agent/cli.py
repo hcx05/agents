@@ -91,6 +91,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                *[f"Worker: {adapters[w.id].display_name} [{w.id}]" + (f" ({w.model})" if w.model else "")
                  for w in cfg.workers],
                f"Folder: {cwd}", f"Session log: {store.dir}", HELP_IN_CHAT])
+    engine.check_cli_versions()          # background; a slow or failing --version never delays or blocks the chat
     interactive = sys.stdin.isatty()
     exit_code = 0
     try:

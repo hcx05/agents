@@ -51,6 +51,7 @@ MODEL_ERR_RE = re.compile(
     r"(invalid|unknown|unsupported|unrecognized)\s+(\w+\s+)?model|model.{0,60}(not (found|exist|available|supported|recognized)|invalid)"
     r"|is not recognized", re.I)
 SESSION_ERR_RE = re.compile(r"(conversation|session).{0,60}(not found|no such|unknown|does not exist|cannot be resumed)", re.I)
+KNOWN_STEPS = ("agent_response", "tool_call", "tool_result", "thinking", "user_input", "planner_response")
 ARGV_PROMPT_LIMIT = 6000  # stay far below Windows' 32k CreateProcess limit
 
 
@@ -115,6 +116,15 @@ class AgyParser(Parser):
         self.error_event: Optional[str] = None
         self.stderr: List[str] = []
         self.denials: List[str] = []
+        self.unknown_events: Dict[str, int] = {}  # event names beside init/step_update/result: ignored, but reported
+        self.unknown_steps: Dict[str, int] = {}
+
+    def diagnostics(self) -> List[str]:
+        out = [f"unfamiliar event {k!r} x{n} (ignored)" for k, n in sorted(self.unknown_events.items())]
+        out += [f"unfamiliar step_type {k!r} x{n} (ignored)" for k, n in sorted(self.unknown_steps.items())]
+        if self.plain:
+            out.append(f"{len(self.plain)} non-JSON stdout line(s)")
+        return out
 
     def _see_session(self, sid: Any) -> None:
         if not isinstance(sid, str) or not sid:
@@ -154,6 +164,9 @@ class AgyParser(Parser):
         if isinstance(name, str) and name.lower() in OFFICIAL_EVENTS:
             self._feed_official(name.lower(), ev)
         else:
+            if self.official or "event" in ev:
+                k = name if isinstance(name, str) else "<no event>"
+                self.unknown_events[k] = self.unknown_events.get(k, 0) + 1
             self._feed_legacy(ev)
 
     def _feed_official(self, name: str, ev: Dict[str, Any]) -> None:
@@ -164,6 +177,10 @@ class AgyParser(Parser):
         inner = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else (ev if name == "step_update" else None)
         self._scan_session((ev, inner, ev.get("data"), res))
         if name == "step_update" and inner is not None:
+            st = inner.get("step_type")
+            if st not in KNOWN_STEPS:
+                k = st if isinstance(st, str) else "<no step_type>"
+                self.unknown_steps[k] = self.unknown_steps.get(k, 0) + 1
             if inner.get("step_type") == "agent_response":
                 d = inner.get("text_delta")
                 if isinstance(d, str):
@@ -211,11 +228,22 @@ class AgyParser(Parser):
             if SESSION_ERR_RE.search(err):
                 return TurnResult(False, error="session cannot be resumed: " + err.strip()[:200], error_kind="session_lost", **base)
             kind = classify_error(err) if err.strip() else "no_output"
+            if kind == "cli_error":
+                kind = "no_output"
+            hint = ""
+            if kind == "no_output" and proc.exit_code in (0, None) and self.unknown_events:
+                kind = "unknown_format"
+                hint = ("unfamiliar events: " + ", ".join(sorted(self.unknown_events))
+                        + " (output format may have changed). ")
             return TurnResult(False, error=f"agy stream ended without a terminal result event (exit code {proc.exit_code}); "
-                                           f"partial output is not accepted. stderr: {err[-300:] or '<empty>'}",
-                              error_kind=kind if kind != "cli_error" else "no_output", **base)
+                                           f"{hint}partial output is not accepted. stderr: {err[-300:] or '<empty>'}",
+                              error_kind=kind, **base)
         status = t.get("status")
         status_s = status.upper() if isinstance(status, str) else ""
+        if "_raw" in t or ((not isinstance(status, str) or not status) and not _err_text(t.get("error"))):
+            return TurnResult(False, error="agy 'result' event has no usable status "
+                                           f"(keys: {', '.join(sorted(map(str, t))[:12])}). Its output format may have changed.",
+                              error_kind="unknown_format", **base)
         e = _err_text(t.get("error"))
         if status_s != "SUCCESS":
             detail = e or err.strip()[:300] or "no error text"

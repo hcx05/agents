@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
-from . import protocol, runner
+from . import compat, protocol, runner
 from .adapters import get_adapter
 from .adapters.base import Adapter, TurnRequest, TurnResult
 from .config import AgentCfg, Config
@@ -130,6 +130,7 @@ class Engine:
         self._thread: Optional[threading.Thread] = None
         self._stopped = False
         self.transitions_log: List[str] = []
+        self.cli_versions: Dict[str, Dict[str, Any]] = {}
         store.update(cwd=cwd, state=self.state.value)
         for a in self.agents.values():
             store.set_agent(a.id, role=a.role, cli=a.cfg.cli, model=a.cfg.model, effort=a.cfg.effort,
@@ -168,6 +169,31 @@ class Engine:
             time.sleep(0.03)
         return False
 
+    def check_cli_versions(self, timeout: float = 8.0, wait: bool = False) -> Optional[threading.Thread]:
+        """Record each agent's CLI version in the background (official `--version`, no model call). Failures only
+        produce a log line / soft notice; they never block or alter a chat."""
+        def work() -> None:
+            for a in list(self.agents.values()):
+                try:
+                    if not a.adapter.version_args_supported():
+                        continue
+                    info = compat.check_version(a.cfg.cli, a.adapter.command_prefix(), self.cwd, timeout)
+                except Exception as e:
+                    info = {"cli": a.cfg.cli, "version": None, "raw": "", "ok": False, "status": "unknown",
+                            "note": f"{type(e).__name__}: {e}"}
+                with self._lock:
+                    self.cli_versions[a.id] = info
+                self.store.log("cli_version", agent=a.id, **info)
+                self.store.set_agent(a.id, cli_version=info.get("version"), cli_version_status=info["status"])
+                note = compat.startup_notice(info)
+                if note:
+                    self.ui.system(note)
+        th = threading.Thread(target=work, name="version-check", daemon=True)
+        th.start()
+        if wait:
+            th.join(timeout * 3 * max(1, len(self.agents)))
+        return th
+
     def _activity(self, a: AgentRT) -> str:
         r = a.running
         if not r:
@@ -186,6 +212,8 @@ class Engine:
                 lines.append(f"  {a.id} ({a.role}, {a.cfg.cli}) {self._activity(a)}{task}, queued={len(a.inbox)}, "
                              f"model={a.cfg.model or 'default'}, effort={a.cfg.effort or 'default'}, "
                              f"session={a.session_id or '-'}")
+            for aid, v in self.cli_versions.items():
+                lines.append(f"  cli {aid}: {v['cli']} {v['version'] or '?'} [{v['status']}] {v['note']}".rstrip())
             open_t = [f"{tid}:{t['status']}@{t['worker']}" for tid, t in self.tasks.items()
                       if t["status"] in protocol.OPEN_TASK_STATES]
             lines.append("  open tasks: " + (", ".join(open_t) or "none"))
@@ -499,7 +527,7 @@ class Engine:
         a = self.agents[d.agent_id]
         a.running = None
         res = d.res
-        self.store.log("turn_end", agent=a.id, ok=res.ok, error_kind=res.error_kind, error=res.error,
+        self.store.log("turn_end", agent=a.id, ok=res.ok, error_kind=res.error_kind, error=res.error, notes=res.notes,
                        exit_code=res.exit_code, mode=res.mode, killed_with=res.killed_with,
                        denials=res.denials, files=d.diff.to_dict() if d.diff else None)
         if res.ok:
@@ -560,6 +588,10 @@ class Engine:
         kind = res.error_kind or "error"
         if kind == "cancelled":
             return
+        if kind == "unknown_format":
+            v = self.cli_versions.get(a.id) or {}
+            res.error = (f"{res.error} [CLI 輸出格式可能已更新；{a.cfg.cli} 版本 {v.get('version') or '未知'}。"
+                         "請回報此錯誤與版本，程式不會猜測未知格式。]")
         if a.role == "worker":
             ev = ""
             status = "timeout" if kind == "timeout" else "failed"

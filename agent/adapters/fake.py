@@ -15,6 +15,9 @@ class FakeAdapter(ClaudeAdapter):
     name = "fake"
     display_name = "Fake"
 
+    def version_args_supported(self) -> bool:
+        return False
+
     def command_prefix(self) -> List[str]:
         cmd = self.cfg.command or os.environ.get("AGENT_FAKE_CLI")
         if cmd:

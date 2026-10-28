@@ -17,6 +17,11 @@ from .. import runner
 from .base import Adapter, Invocation, Parser, TurnRequest, TurnResult
 
 
+KNOWN_TYPES = ("system", "stream_event", "assistant", "user", "result", "rate_limit_event", "control_request",
+               "control_response", "tool_progress", "keep_alive")
+RESULT_KEYS = ("result", "structured_output")
+
+
 def _brief_denial(d: Any) -> str:
     if not isinstance(d, dict):
         return str(d)[:120]
@@ -41,6 +46,8 @@ class ClaudeParser(Parser):
         self.denials: List[str] = []
         self.stderr: List[str] = []
         self.bad_lines = 0
+        self.json_lines = 0
+        self.unknown_types: Dict[str, int] = {}      # unfamiliar event types: ignored, but reported
         self.tool_denial_texts: List[str] = []
 
     def feed(self, stream: str, line: str) -> None:
@@ -57,6 +64,11 @@ class ClaudeParser(Parser):
             return
         if not isinstance(ev, dict):
             return
+        self.json_lines += 1
+        t0 = ev.get("type")
+        if not isinstance(t0, str) or t0 not in KNOWN_TYPES:
+            k = t0 if isinstance(t0, str) else "<no type>"
+            self.unknown_types[k] = self.unknown_types.get(k, 0) + 1
         sid = ev.get("session_id")
         if isinstance(sid, str) and sid and sid != self.session_id:
             self.session_id = sid
@@ -93,6 +105,12 @@ class ClaudeParser(Parser):
             if proc.status in ("timeout", "cancelled"):
                 return TurnResult(False, **base)
             msg = f"CLI produced no result event (exit code {proc.exit_code}). stderr: {err_txt[-400:] or '<empty>'}"
+            if proc.exit_code == 0 and (self.unknown_types or (self.bad_lines and not self.json_lines)):
+                what = ("unfamiliar event types: " + ", ".join(sorted(self.unknown_types))) if self.unknown_types \
+                    else "stdout was not stream-json"
+                return TurnResult(False, error=f"CLI exited normally but sent no 'result' event; {what}. "
+                                               "Its output format may have changed. " + msg,
+                                  error_kind="unknown_format", **base)
             return TurnResult(False, error=msg, error_kind="no_output" if proc.exit_code == 0 else "exit", **base)
         text = res.get("result") if isinstance(res.get("result"), str) else ""
         if res.get("is_error") or res.get("subtype") not in (None, "success"):
@@ -103,6 +121,10 @@ class ClaudeParser(Parser):
             msg = text or "; ".join(map(str, res.get("errors") or [])) or f"subtype={res.get('subtype')}"
             return TurnResult(False, error=msg, error_kind=kind, **base)
         structured = res.get("structured_output")
+        if structured is None and not text and not self.assistant_text and not any(k in res for k in RESULT_KEYS):
+            return TurnResult(False, error="'result' event has none of the expected fields "
+                                           f"(keys: {', '.join(sorted(map(str, res))[:12])}). Its output format may have changed.",
+                              error_kind="unknown_format", **base)
         if structured is not None:
             return TurnResult(True, text=json.dumps(structured, ensure_ascii=False), **base)
         # No structured_output: do NOT pretend. Return raw text; orchestrator validates it as JSON.
@@ -111,6 +133,16 @@ class ClaudeParser(Parser):
         if proc.exit_code not in (0, None) and proc.status == "ok":
             return TurnResult(False, error=f"CLI exit code {proc.exit_code}: {err_txt[-300:]}", error_kind="exit", **base)
         return TurnResult(True, text=text, **base)
+
+
+def _diag_unknown(self) -> List[str]:
+    out = [f"unfamiliar event type {k!r} x{n} (ignored)" for k, n in sorted(self.unknown_types.items())]
+    if self.bad_lines:
+        out.append(f"{self.bad_lines} non-JSON stdout line(s)")
+    return out
+
+
+ClaudeParser.diagnostics = _diag_unknown  # type: ignore[attr-defined]
 
 
 def _first_line(blob: str, needle: str) -> str:
