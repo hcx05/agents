@@ -25,6 +25,10 @@ AUTH_RETRY_ERRORS = ("authentication_failed", "oauth_org_not_allowed", "account_
 AUTH_TEXT_RE = re.compile(r"not logged in|please run /login|invalid api key|authentication[_ ]failed|oauth", re.I)
 # Documented behaviour of `claude -p --resume <id>` on a session that is still running in the background:
 # exit status 1, "the session is running in the background" plus the `claude attach <id>` / `claude agents` hint.
+# Claude Code refuses to create a session under an id that already exists ("Error: Session ID <id> is already in use.").
+# Seen in Claude Code 2.1.312 on Linux; NOT in the official docs, so it is only used as one more way to say "no".
+IN_USE_RE = re.compile(r"Session ID \S+ is already in use", re.I)
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 BUSY_RE = re.compile(r"running in the background|claude attach|your prompt was not sent to it", re.I)
 
 
@@ -49,6 +53,7 @@ class ClaudeParser(Parser):
         self.session_id: Optional[str] = None        # id we adopted (and told the engine about)
         self.expected = req.session_id               # id we asked to resume (None on a first turn)
         self.fork = req.fork
+        self.chosen = req.new_session_id if req.fork else None   # strict fork: the ONLY id the new session may have
         self.mismatch: Optional[str] = None          # id the CLI used although we asked for another one
         self.ids_seen: List[str] = []
         self.init_model: Optional[str] = None
@@ -114,6 +119,14 @@ class ClaudeParser(Parser):
         another session, and a fork must never be accepted while it still points at the original."""
         if sid not in self.ids_seen:
             self.ids_seen.append(sid)
+        if self.chosen is not None:
+            # Strict fork: we chose the new id before starting the CLI, so the engine already has it and is never
+            # told about any id from here. The original id may still appear (hook events); anything else is refused.
+            if sid == self.chosen:
+                self.session_id = sid
+            elif sid != self.expected and self.mismatch is None:
+                self.mismatch = sid
+            return
         if self.expected is None:
             if sid != self.session_id:
                 self.session_id = sid
@@ -168,8 +181,15 @@ class ClaudeParser(Parser):
                 "No conversation found" in str(e) for e in (res or {}).get("errors") or []):
             return TurnResult(False, error="session cannot be resumed: " + _first_line(err_txt, "No conversation found"),
                               error_kind="session_lost", **base)
+        if self.chosen is not None and IN_USE_RE.search(err_txt):
+            return TurnResult(False, session_id=None, denials=denials, error_kind="fork_exists",
+                              error=f"the CLI refused to create session {self.chosen}: " + _first_line(err_txt, "already in use"))
         if proc.status in ("timeout", "cancelled"):
             return TurnResult(False, **base)
+        if self.chosen is not None and (self.mismatch or self.session_id != self.chosen):
+            return TurnResult(False, session_id=None, denials=denials, error_kind="fork_failed",
+                              error=f"the fork did not get the requested session id {self.chosen} "
+                                    f"(ids seen: {', '.join(self.ids_seen) or 'none'}); the result was discarded")
         if self.mismatch:
             return TurnResult(False, session_id=self.expected, denials=denials, error_kind="session_lost",
                               error=f"CLI used session {self.mismatch!r} although {self.expected!r} was requested; "
@@ -268,10 +288,16 @@ class ClaudeAdapter(Adapter):
 
     def build(self, req: TurnRequest, prefix: List[str]) -> Invocation:
         args = ["-p", "--output-format", "stream-json", "--verbose"]
+        if req.new_session_id is not None:
+            if not (req.fork and req.session_id and UUID_RE.match(req.new_session_id)
+                    and req.new_session_id.lower() != req.session_id.lower()):
+                raise ValueError("new_session_id needs fork=True, a source session_id and a UUID different from it")
         if req.session_id:
             args += ["--resume", req.session_id]
             if req.fork:
                 args += ["--fork-session"]        # official: copy the history into a NEW session, original untouched
+                if req.new_session_id:
+                    args += ["--session-id", req.new_session_id]   # not in the CLI reference table: Windows-verified by probe.py
         else:
             # we choose the id, so it is known (and saved) before the CLI even starts
             req_sid = self.new_session_id()

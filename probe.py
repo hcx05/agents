@@ -12,6 +12,10 @@
                                                       # EXPERIMENT B: fork a session YOU made in an interactive window
                                                       # (as a copy; the original is only read). See README for steps.
                                                       # Both stop (exit 3) inside a Claude Code shell (CLAUDE_CODE_SESSION_ID).
+    python probe.py claude --tests fork-chosen        # EXPERIMENT C (~3 small calls): fork a throwaway headless session
+                                                      # under an id WE choose (--resume A --fork-session --session-id B).
+    python probe.py claude --tests fork-chosen-interactive --session-id <uuid> [--confirm-fork]
+                                                      # same checks against YOUR interactive session (copy; original only read)
     python probe.py agy --tests keys       # EXPERIMENT (opt-in, 1 small call): which keys do agy's events carry
                                            # (is there a model field?) - prints key NAMES only
 
@@ -129,6 +133,10 @@ def probe_claude(prefix, cwd, tests):
         probe_fork_headless(ad, prefix, cwd)
     if "fork-interactive" in tests:
         probe_fork_interactive(ad, prefix, cwd)
+    if "fork-chosen" in tests:
+        probe_fork_chosen_headless(ad, prefix, cwd)
+    if "fork-chosen-interactive" in tests:
+        probe_fork_chosen_interactive(ad, prefix, cwd)
 
 
 def claude_config_dir() -> Path:
@@ -251,33 +259,121 @@ def probe_fork_headless(ad, prefix, cwd):
     print("   NOTE: a headless session is not an interactive one; this does not validate importing a real interactive session.")
 
 
-def probe_fork_interactive(ad, prefix, cwd):
-    """EXPERIMENT B (interactive): fork a session YOU created in a normal interactive `claude` window. The original is
-    only read (size + hash) and only passed to --resume --fork-session. Required: --session-id and --confirm-fork."""
-    print("\n-- fork-interactive: a real interactive Claude session of yours, forked as a COPY --")
+def interactive_target(label):
+    """The checks shared by every experiment on YOUR interactive session. Returns (session_id, transcript) when it is safe
+    to go on, else records a STOPPED result and returns None. Nothing is sent to the model here."""
     why = fork_blocker()
     if why:
-        return stop("fork-interactive: refused to run", why)
+        return stop(f"{label}: refused to run", why)
     sid = OPTS["session_id"]
     if not sid or not UUID_RE.match(sid):
-        return stop("fork-interactive: refused to run", "pass --session-id <uuid> (the file name of the session's .jsonl "
-                                                         "under %USERPROFILE%\\.claude\\projects\\<project>\\)")
+        return stop(f"{label}: refused to run", "pass --session-id <uuid> (the file name of the session's .jsonl "
+                                                "under %USERPROFILE%\\.claude\\projects\\<project>\\)")
     t_path = find_transcript(sid)
     if t_path is None:
-        return stop("fork-interactive: refused to run", f"no single transcript for {sid} under {claude_config_dir() / 'projects'} "
-                                                        "(missing, or the id exists in more than one project folder)")
+        return stop(f"{label}: refused to run", f"no single transcript for {sid} under {claude_config_dir() / 'projects'} "
+                                                "(missing, or the id exists in more than one project folder)")
     age = time.time() - t_path.stat().st_mtime
     if age < RECENT_SEC:
-        return stop("fork-interactive: refused to run", f"{t_path.name} was written {int(age)}s ago: it may still be open in a "
-                                                        "Claude window. Exit that session (/exit), wait two minutes, retry.")
+        return stop(f"{label}: refused to run", f"{t_path.name} was written {int(age)}s ago: it may still be open in a "
+                                                "Claude window. Exit that session (/exit), wait two minutes, retry.")
     print(f"   transcript: {t_path}  ({t_path.stat().st_size} bytes, entrypoint field: {transcript_entrypoint(t_path) or 'unknown'})")
     print("   The fork RESUMES the whole conversation as a copy, so the entire history is sent to the model: the quota used "
           "grows with its length. Your original session is not modified.")
     if not OPTS["confirm_fork"]:
-        return stop("fork-interactive: waiting for confirmation", "nothing was sent. Re-run with --confirm-fork to proceed")
+        return stop(f"{label}: waiting for confirmation", "nothing was sent. Re-run with --confirm-fork to proceed")
+    return sid, t_path
+
+
+def probe_fork_interactive(ad, prefix, cwd):
+    """EXPERIMENT B (interactive): fork a session YOU created in a normal interactive `claude` window. The original is
+    only read (size + hash) and only passed to --resume --fork-session. Required: --session-id and --confirm-fork."""
+    print("\n-- fork-interactive: a real interactive Claude session of yours, forked as a COPY --")
+    target = interactive_target("fork-interactive")
+    if target is None:
+        return
+    sid, t_path = target
     print(f"   launcher kind: {prefix[0]!r}  cmd-shim: {runner.is_cmd_shim(prefix)}")
     fork_and_check(ad, cwd, sid, t_path, "fork-interactive",
                    "In one or two sentences, what were we working on in this conversation? Answer with a final action.")
+
+
+def chosen_fork_check(ad, cwd, a_id, t_path, label, code_word=None):
+    """EXPERIMENT C steps: the fork gets an id WE chose before starting the CLI. Nothing here accepts "some other id":
+    the adapter returns fork_failed for it, and a failure is recorded as FAIL, never worked around. The ORIGINAL session
+    is passed only to the first call (as the --resume source of --fork-session); every later call uses B."""
+    b_id = str(uuid.uuid4())
+    fp_a = file_fingerprint(t_path)
+    record(f"{label}: original transcript located (for the unchanged check)", "PASS" if fp_a else "UNKNOWN",
+           str(t_path) if t_path else "not found under CLAUDE_CONFIG_DIR/projects; unchanged-check will be skipped")
+    saved = []
+    r1 = ad.run(TurnRequest("probe", "Reply with say=forked.", cwd, a_id, schema=TINY, fork=True, new_session_id=b_id,
+                            timeout=600), threading.Event(), saved.append)
+    record(f"{label}: --resume A --fork-session --session-id B accepted", "PASS" if r1.ok else "FAIL",
+           f"{r1.error_kind}: {r1.error}" if not r1.ok else r1.mode)
+    record(f"{label}: reported session id is exactly the chosen id B", "PASS" if (r1.ok and r1.session_id == b_id) else "FAIL",
+           f"chosen={b_id} reported={r1.session_id}")
+    record(f"{label}: no other session id was adopted", "PASS" if saved == [] else "FAIL", f"adopted={saved}")
+    t_b = find_transcript(b_id)
+    fp_b = file_fingerprint(t_b)
+    record(f"{label}: fork transcript stored under B (informational; the location is internal)", "PASS" if fp_b else "UNKNOWN",
+           str(t_b) if t_b else "not found")
+    if fp_a:
+        record(f"{label}: original transcript unchanged after the fork", "PASS" if file_fingerprint(t_path) == fp_a else "FAIL",
+               f"before={fp_a[0]}B")
+    if not r1.ok:
+        return
+    r2 = ad.run(TurnRequest("probe", "Reply with say=again.", cwd, a_id, schema=TINY, fork=True, new_session_id=b_id,
+                            timeout=600), threading.Event(), lambda s: None)
+    record(f"{label}: creating the same B again is refused", "PASS" if (not r2.ok and r2.error_kind == "fork_exists") else "FAIL",
+           f"{r2.error_kind}: {(r2.error or 'ACCEPTED - the CLI did not refuse a duplicate id')[:140]}")
+    if fp_b:
+        record(f"{label}: fork B unchanged by the refused duplicate", "PASS" if file_fingerprint(find_transcript(b_id)) == fp_b else "FAIL", "")
+    question = ("What code word did I give you earlier? Put it in say." if code_word else
+                "In one or two sentences, what were we working on in this conversation? Put it in say.")
+    r3 = ad.run(TurnRequest("probe", question, cwd, b_id, schema=TINY, timeout=600), threading.Event(), saved.append)
+    record(f"{label}: later plain --resume B works and keeps id B", "PASS" if (r3.ok and r3.session_id == b_id and saved == []) else "FAIL",
+           f"{r3.error_kind}: {r3.error}" if not r3.ok else f"reported={r3.session_id}")
+    if r3.ok:
+        say = ""
+        try:
+            say = str(json.loads(r3.text).get("say", ""))
+        except ValueError:
+            say = r3.text
+        if code_word:
+            record(f"{label}: fork B has the earlier conversation", "PASS" if code_word in say.upper() else "FAIL", say[:80])
+        else:
+            record(f"{label}: answer about the earlier conversation (judge it yourself)", "UNKNOWN", redact(say)[:300])
+    if fp_a:
+        record(f"{label}: original transcript still unchanged after all calls", "PASS" if file_fingerprint(t_path) == fp_a else "FAIL", "")
+    print(f"   the fork copy is session {b_id}; it stays in Claude's own storage (your original is not modified)")
+
+
+def probe_fork_chosen_headless(ad, prefix, cwd):
+    """EXPERIMENT C (headless): create a throwaway `claude -p` session, then fork it under an id we choose. Proves the
+    chosen-id mechanics only, NOT that a session made in an interactive window behaves the same (use fork-chosen-interactive)."""
+    print("\n-- fork-chosen: throwaway headless session forked under a chosen id --")
+    why = fork_blocker()
+    if why:
+        return stop("fork-chosen: refused to run", why)
+    print(f"   launcher kind: {prefix[0]!r}  cmd-shim: {runner.is_cmd_shim(prefix)}")
+    ra = ad.run(TurnRequest("probe", "Remember this code word: PINEAPPLE-42. Reply with one short sentence.", cwd, None,
+                            timeout=240), threading.Event(), lambda s: None)
+    record("fork-chosen: free-form session created", "PASS" if ra.ok and ra.session_id else "FAIL", ra.error or ra.session_id or "")
+    if ra.ok and ra.session_id:
+        chosen_fork_check(ad, cwd, ra.session_id, find_transcript(ra.session_id), "fork-chosen", code_word="PINEAPPLE")
+
+
+def probe_fork_chosen_interactive(ad, prefix, cwd):
+    """EXPERIMENT C (interactive): the same chosen-id checks on a session YOU created in an interactive window (copied,
+    the original is only read). Required: --session-id and --confirm-fork. Sends the whole history to the model."""
+    print("\n-- fork-chosen-interactive: your interactive session forked as a COPY under a chosen id --")
+    target = interactive_target("fork-chosen-interactive")
+    if target is None:
+        return
+    sid, t_path = target
+    print(f"   launcher kind: {prefix[0]!r}  cmd-shim: {runner.is_cmd_shim(prefix)}")
+    chosen_fork_check(ad, cwd, sid, t_path, "fork-chosen-interactive")
 
 
 def probe_agy_keys(prefix, cwd):
@@ -414,9 +510,9 @@ def main():
     ap.add_argument("cli", choices=["claude", "agy"])
     ap.add_argument("--tests", help="comma list; default = everything for that CLI")
     ap.add_argument("--command", help="explicit path to the CLI executable")
-    ap.add_argument("--session-id", help="fork-interactive only: UUID of YOUR interactive Claude session to fork as a copy")
+    ap.add_argument("--session-id", help="fork-interactive / fork-chosen-interactive only: UUID of YOUR interactive Claude session to fork as a copy")
     ap.add_argument("--confirm-fork", action="store_true",
-                    help="fork-interactive only: acknowledge that the whole conversation is sent to the model")
+                    help="fork-interactive / fork-chosen-interactive only: acknowledge that the whole conversation is sent to the model")
     a = ap.parse_args()
     OPTS["session_id"], OPTS["confirm_fork"] = a.session_id, a.confirm_fork
     tests = set((a.tests or DEFAULTS[a.cli]).split(","))

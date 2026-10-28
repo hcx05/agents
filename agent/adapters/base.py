@@ -21,6 +21,7 @@ class TurnRequest:
     schema: Optional[Dict[str, Any]] = None
     timeout: float = 1800
     fork: bool = False                 # resume session_id as a COPY (--fork-session); only the first turn of an import
+    new_session_id: Optional[str] = None   # with fork: the UUID the fork MUST get (--session-id). Strict: any other id = fork_failed
 
 
 @dataclass
@@ -37,7 +38,7 @@ class TurnResult:
     session_id: Optional[str] = None
     error: Optional[str] = None
     # not_found|start_failed|timeout|cancelled|session_lost|model_invalid|effort_invalid|
-    # unsupported|cli_error|no_output|exit|unknown_format|session_busy|auth_error|fork_failed
+    # unsupported|cli_error|no_output|exit|unknown_format|session_busy|auth_error|fork_failed|fork_exists
     # (unknown_format: the CLI's output no longer looks like what this adapter understands; never guessed at)
     error_kind: Optional[str] = None
     denials: List[str] = field(default_factory=list)

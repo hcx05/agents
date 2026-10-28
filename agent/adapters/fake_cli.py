@@ -7,7 +7,10 @@ Step keys: reply(obj) | text(str) | sleep(sec) | exit(code) | stderr(str) | raw_
            denial([{tool_name,tool_input}]) | expect_prompt_contains([str]) | expect_turn(int) |
            write_file({path,content}) | is_error(str) | forget_sessions_of(agent id) | wait_for_file(path relative to cwd) |
            report_model(str: init.model) | omit_model(bool) | assistant_model(str) | api_retry_error(str) |
-           fork_keeps_id(bool: --fork-session "forgets" to create a new session)
+           fork_keeps_id(bool: --fork-session "forgets" to create a new session) |
+           fork_ignores_session_id(bool: --fork-session ignores the requested --session-id and picks a random id)
+Like the real CLI (2.1.312): --session-id with --resume needs --fork-session, and an id that already exists is refused
+("Error: Session ID X is already in use.", exit 1, before any scenario step is consumed).
 """
 import json
 import os
@@ -67,6 +70,23 @@ def main():
     sid = opts["resume"] or opts["session_id"] or str(uuid.uuid4())
     spath = os.path.join(state, "sessions", sid + ".json")
     pstep = peek_step(state, agent)
+    reject = None
+    if opts["resume"] and opts["session_id"] and not opts["fork"]:
+        reject = "Error: --session-id can only be used with --continue or --resume if --fork-session is also specified."
+    elif opts["session_id"] and not opts["resume"] and os.path.exists(spath):
+        reject = f"Error: Session ID {sid} is already in use."
+    elif opts["resume"] and opts["fork"] and opts["session_id"] and not pstep.get("fork_keeps_id") \
+            and not pstep.get("fork_ignores_session_id") \
+            and os.path.exists(os.path.join(state, "sessions", opts["session_id"] + ".json")):
+        reject = f"Error: Session ID {opts['session_id']} is already in use."
+    if reject:
+        with open(os.path.join(state, "calls.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"agent": agent, "session": sid, "resume": bool(opts["resume"]), "rejected": reject,
+                                "turn": 0, "model": opts["model"], "effort": opts["effort"], "cwd": os.getcwd(),
+                                "has_schema": opts["schema"] is not None, "prompt": prompt,
+                                "argv": sys.argv[1:]}, ensure_ascii=False) + "\n")
+        sys.stderr.write(reject + "\n")
+        return 1
     if opts["resume"]:
         if not os.path.exists(spath):
             print(f"No conversation found with session ID: {sid}")
@@ -76,7 +96,8 @@ def main():
         sess = json.load(open(spath, encoding="utf-8"))
         if opts["fork"] and not pstep.get("fork_keeps_id"):
             # official behaviour: the history is COPIED into a new session, the original file stays untouched
-            sid = str(uuid.uuid4())
+            chosen = opts["session_id"] if not pstep.get("fork_ignores_session_id") else None
+            sid = chosen or str(uuid.uuid4())
             sess = dict(sess, forked_from=opts["resume"])
             spath = os.path.join(state, "sessions", sid + ".json")
     else:

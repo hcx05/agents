@@ -86,6 +86,24 @@ Get-FileHash <同一個 .jsonl>
 
 預期：所有項目 PASS、原檔雜湊不變。任何一項 FAIL 就不要推進匯入功能。
 
+#### 指定 Fork ID 的驗證（第一批，正式匯入的前置條件）
+
+正式匯入計畫在 fork 前先決定並保存新 Session 的 ID（`claude -p --resume A --fork-session --session-id B`），才能在當機後安全恢復。這個組合**不在 Claude 官方 CLI 參考表內**，Linux 上測過可行，所以 Windows 必須先通過下列實驗，否則不進行正式整合（也**不會**退回「接受 CLI 產生的任意新 ID」）：
+
+| 實驗 | 做什麼 |
+|---|---|
+| `fork-chosen` | 腳本自己建立拋棄式 headless Session（含暗號），再以我們指定的 ID B fork |
+| `fork-chosen-interactive` | 同樣的檢查，對象是你在互動視窗建立的 Session（副本；原檔只讀取雜湊） |
+
+每個實驗檢查：成功後回報的 ID 必須**正好是 B**、沒有採用其他 ID；原檔雜湊在 fork 前後與全部呼叫結束後相同；同一個 B 再建立一次必須被拒絕（`fork_exists`），且 B 的內容不變；之後 `--resume B` 成功並保持 ID B（headless 版另驗證暗號仍在）。任何不符都是 FAIL，不會自動改用其他做法。同樣會在 `CLAUDE_CODE_SESSION_ID` 存在時停止（結束碼 3）。
+
+```powershell
+# 在一般 PowerShell 視窗（不是 Claude Code 內）。確認：echo $env:CLAUDE_CODE_SESSION_ID 應為空
+py probe.py claude --tests fork-chosen
+# 互動版：同上方步驟 1~3 取得 ID；先不加 --confirm-fork 只做檢查，確認後再加
+py probe.py claude --tests fork-chosen-interactive --session-id <ID> --confirm-fork
+```
+
 ### 每則回覆的模型
 
 每個 Agent 回覆前會在聊天室標一行 `Manager · claude · <模型>（CLI 回報）`，只在該 Agent 的模型變動時再出現。三種意義不同：**CLI 回報**（CLI 在這個 turn 的事件裡明說用了什麼）／**要求使用 X（CLI 未確認）**（我們傳了 `--model`，但 CLI 沒回報）／**模型未知**。要求的模型不會被當成實際模型；每個 turn 各自記錄（`events.jsonl` 的 `chat.turn`），之後改設定不會改寫歷史。agy 目前沒有已確認的模型欄位，所以通常顯示「要求使用」或「未知」。
