@@ -38,6 +38,24 @@ agent                 # 進入聊天室（以目前資料夾為 Agent 的工作�
 Agent 工作時你可以繼續輸入；Manager 忙碌時訊息會排隊。每次 `agent` 都建立新對話。
 輸入僅支援單行（Enter 送出）。Agent 輸出會在你輸入一半時插入，這時提示字元會重畫、已打的字仍在輸入緩衝區。
 
+### 恢復對話：`agent sessions` / `agent resume <id>`
+
+```powershell
+agent sessions                 # 列出已保存的 Agent Session（含 [IN USE] 標記）
+agent resume <Agent Session ID>   # 顯示先前聊天室內容，再用原本的 Manager / Worker CLI Session 繼續
+```
+
+- **會恢復**：Manager 與 Worker 的 CLI Session ID、`preamble_sent`（已成功套用的 preamble 不會重送）、任務狀態、等待使用者回答的 `ask_user` 問題、排隊中的訊息／Worker 回報／系統通知、先前的聊天紀錄（`events.jsonl`）。
+- **不會自動重做**：上次被切斷、結果未知的 turn（Manager 正在處理的訊息、Worker 進行中的任務）。Worker 任務會標為 `interrupted`，聊天室會列出哪些你的訊息需要重送；檔案不會還原。保留下來的排隊項目恢復後先**暫停**，輸入 `/continue` 才處理（直接輸入新訊息也會處理，排在它們之後；`/interrupt` 丟棄）。
+- **同一 Session 只允許一個寫入者**：Session 目錄內有 `session.lock`（pid + 心跳）。擁有者還活著就拒絕，絕不覆蓋；擁有者已消失（當機）才接手殘留鎖。若鎖看起來卡住但程序仍在，訊息會告訴你要手動刪哪個檔案。
+- 必須在原本的資料夾內恢復（否則加 `--here`）；設定檔中某個 Agent 的 CLI 與原 Session 不同會拒絕恢復（模型／effort 不同只是警告）。
+- 舊版（v1）Session 可讀可恢復，但當時沒有保存的暫存訊息無法復原。
+- Claude 的 `-p` Session 預設只保留約 30 天（CLI 的 `cleanupPeriodDays`），過期後會出現 `session_lost`，本工具不會自動換新 Session。
+
+### 每則回覆的模型
+
+每個 Agent 回覆前會在聊天室標一行 `Manager · claude · <模型>（CLI 回報）`，只在該 Agent 的模型變動時再出現。三種意義不同：**CLI 回報**（CLI 在這個 turn 的事件裡明說用了什麼）／**要求使用 X（CLI 未確認）**（我們傳了 `--model`，但 CLI 沒回報）／**模型未知**。要求的模型不會被當成實際模型；每個 turn 各自記錄（`events.jsonl` 的 `chat.turn`），之後改設定不會改寫歷史。agy 目前沒有已確認的模型欄位，所以通常顯示「要求使用」或「未知」。
+
 ### 設定檔 `%APPDATA%\agent\config.json`
 
 預設內容即規格中的設定（manager=`claude`、`w1`=`agy`）。`model`/`effort` 為 `null` 時沿用 CLI 預設；

@@ -253,6 +253,7 @@ Delegation principles (you decide; delegating is optional):
   - Dispatch only when a worker brings real capability, quality or speed. Each dispatch costs CLI start-up latency, model usage and context.
   - Having a worker is not a reason to use it. You may work yourself while a worker handles another part.
   - You stay responsible for verifying worker results and for the final report.
+  - When you do delegate to a worker, always use a 'dispatch' action. Never start the worker's CLI yourself (for example through a shell tool or a skill): that bypasses the team's tracking. Doing the work yourself without any worker remains fine.
 
 Rules:
   - Input arrives as tagged blocks: [from user], [user answer], [from <worker> | task <id> | status <s>], [system].

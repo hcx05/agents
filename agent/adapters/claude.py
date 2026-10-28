@@ -20,6 +20,12 @@ from .base import Adapter, Invocation, Parser, TurnRequest, TurnResult
 KNOWN_TYPES = ("system", "stream_event", "assistant", "user", "result", "rate_limit_event", "control_request",
                "control_response", "tool_progress", "keep_alive")
 RESULT_KEYS = ("result", "structured_output")
+# Documented `system/api_retry.error` categories (code.claude.com headless docs) that mean "this login/account cannot be used".
+AUTH_RETRY_ERRORS = ("authentication_failed", "oauth_org_not_allowed", "account_on_hold", "billing_error")
+AUTH_TEXT_RE = re.compile(r"not logged in|please run /login|invalid api key|authentication[_ ]failed|oauth", re.I)
+# Documented behaviour of `claude -p --resume <id>` on a session that is still running in the background:
+# exit status 1, "the session is running in the background" plus the `claude attach <id>` / `claude agents` hint.
+BUSY_RE = re.compile(r"running in the background|claude attach|your prompt was not sent to it", re.I)
 
 
 def _brief_denial(d: Any) -> str:
@@ -40,7 +46,16 @@ class ClaudeParser(Parser):
         self.req = req
         self.on_session = on_session
         self.schema_mode = schema_mode
-        self.session_id: Optional[str] = None
+        self.session_id: Optional[str] = None        # id we adopted (and told the engine about)
+        self.expected = req.session_id               # id we asked to resume (None on a first turn)
+        self.fork = req.fork
+        self.mismatch: Optional[str] = None          # id the CLI used although we asked for another one
+        self.ids_seen: List[str] = []
+        self.init_model: Optional[str] = None
+        self.assistant_models: List[str] = []
+        self.usage_models: List[str] = []
+        self.cli_meta: Dict[str, Any] = {}
+        self.retry_errors: List[str] = []
         self.result: Optional[Dict[str, Any]] = None
         self.assistant_text: List[str] = []
         self.denials: List[str] = []
@@ -70,13 +85,20 @@ class ClaudeParser(Parser):
             k = t0 if isinstance(t0, str) else "<no type>"
             self.unknown_types[k] = self.unknown_types.get(k, 0) + 1
         sid = ev.get("session_id")
-        if isinstance(sid, str) and sid and sid != self.session_id:
-            self.session_id = sid
-            self.on_session(sid)
+        if isinstance(sid, str) and sid:
+            self._see_session(sid)
         t = ev.get("type")
-        if t == "result":
+        if t == "system":
+            self._see_system(ev)
+        elif t == "result":
             self.result = ev
+            usage = ev.get("modelUsage")
+            if isinstance(usage, dict):
+                self.usage_models = [k for k in usage if isinstance(k, str) and k and not k.startswith("<")]
         elif t == "assistant":
+            m = (ev.get("message") or {}).get("model") if isinstance(ev.get("message"), dict) else None
+            if isinstance(m, str) and m and not m.startswith("<") and m not in self.assistant_models:
+                self.assistant_models.append(m)
             for blk in (ev.get("message") or {}).get("content") or []:
                 if isinstance(blk, dict) and blk.get("type") == "text":
                     self.assistant_text.append(blk.get("text", ""))
@@ -86,10 +108,55 @@ class ClaudeParser(Parser):
                         and re.search(r"permission|haven't granted|not allowed|denied", str(blk.get("content")), re.I)):
                     self.tool_denial_texts.append(str(blk.get("content"))[:160])
 
+    def _see_session(self, sid: str) -> None:
+        """Adopt a session id only when it is the one we asked for (resume), the first one we get (new session),
+        or - for an explicit fork - the first id that is NOT the original. A resume must never silently move to
+        another session, and a fork must never be accepted while it still points at the original."""
+        if sid not in self.ids_seen:
+            self.ids_seen.append(sid)
+        if self.expected is None:
+            if sid != self.session_id:
+                self.session_id = sid
+                self.on_session(sid)
+        elif self.fork:
+            if sid != self.expected and self.session_id is None:
+                self.session_id = sid
+                self.on_session(sid)
+            elif sid != self.expected and sid != self.session_id and self.mismatch is None:
+                self.mismatch = sid                  # a second, different new id: refuse to guess
+        elif sid != self.expected and self.mismatch is None:
+            self.mismatch = sid                      # never adopted, never saved
+
+    def _see_system(self, ev: Dict[str, Any]) -> None:
+        sub = ev.get("subtype")
+        if sub == "init":
+            m = ev.get("model")
+            if isinstance(m, str) and m and not m.startswith("<"):
+                self.init_model = m
+            # optional, not guaranteed by any contract: kept only when present and well-typed
+            if isinstance(ev.get("claude_code_version"), str):
+                self.cli_meta["cli_version"] = ev["claude_code_version"]
+            if isinstance(ev.get("apiKeySource"), str):
+                self.cli_meta["api_key_source"] = ev["apiKeySource"]
+            caps = ev.get("capabilities")
+            if isinstance(caps, list):
+                self.cli_meta["capabilities"] = [c for c in caps if isinstance(c, str)][:20]
+        elif sub == "api_retry" and isinstance(ev.get("error"), str):
+            self.retry_errors.append(ev["error"])
+
+    def reported(self) -> Dict[str, Any]:
+        seen: List[str] = []
+        for m in self.assistant_models + ([self.init_model] if self.init_model else []) + self.usage_models:
+            if m not in seen:
+                seen.append(m)
+        model = (self.assistant_models[-1] if self.assistant_models else self.init_model
+                 or (self.usage_models[0] if len(self.usage_models) == 1 else None))
+        return {"model": model, "models": seen, "meta": dict(self.cli_meta)}
+
     def finish(self, proc: runner.ProcResult) -> TurnResult:
         err_txt = "\n".join(self.stderr)
         res = self.result
-        sid = (res or {}).get("session_id") or self.session_id
+        sid = (res or {}).get("session_id") or self.session_id or (None if self.fork else self.expected)
         denials = [_brief_denial(d) for d in (res or {}).get("permission_denials") or []]
         if not denials:
             denials = list(self.tool_denial_texts)
@@ -101,9 +168,23 @@ class ClaudeParser(Parser):
                 "No conversation found" in str(e) for e in (res or {}).get("errors") or []):
             return TurnResult(False, error="session cannot be resumed: " + _first_line(err_txt, "No conversation found"),
                               error_kind="session_lost", **base)
+        if proc.status in ("timeout", "cancelled"):
+            return TurnResult(False, **base)
+        if self.mismatch:
+            return TurnResult(False, session_id=self.expected, denials=denials, error_kind="session_lost",
+                              error=f"CLI used session {self.mismatch!r} although {self.expected!r} was requested; "
+                                    "refusing to treat it as the same session")
+        if self.fork and self.session_id is None:
+            return TurnResult(False, session_id=None, denials=denials, error_kind="fork_failed",
+                              error="the CLI did not create a new session for --fork-session (it kept the original id); "
+                                    "the result was discarded so the original session is not used")
+        if res is None and proc.exit_code not in (0, None) and BUSY_RE.search(err_txt):
+            return TurnResult(False, error="that Claude session is still running in the background (or in another "
+                                           "process): " + _first_line(err_txt, "background"),
+                              error_kind="session_busy", **base)
+        if self._auth_problem(res, err_txt):
+            return TurnResult(False, error=self._auth_message(res, err_txt), error_kind="auth_error", **base)
         if res is None:
-            if proc.status in ("timeout", "cancelled"):
-                return TurnResult(False, **base)
             msg = f"CLI produced no result event (exit code {proc.exit_code}). stderr: {err_txt[-400:] or '<empty>'}"
             if proc.exit_code == 0 and (self.unknown_types or (self.bad_lines and not self.json_lines)):
                 what = ("unfamiliar event types: " + ", ".join(sorted(self.unknown_types))) if self.unknown_types \
@@ -133,6 +214,29 @@ class ClaudeParser(Parser):
         if proc.exit_code not in (0, None) and proc.status == "ok":
             return TurnResult(False, error=f"CLI exit code {proc.exit_code}: {err_txt[-300:]}", error_kind="exit", **base)
         return TurnResult(True, text=text, **base)
+
+
+def _auth_problem(self, res: Optional[Dict[str, Any]], err_txt: str) -> bool:
+    if any(e in AUTH_RETRY_ERRORS for e in self.retry_errors):
+        return True
+    if res is not None and (res.get("is_error") or res.get("subtype") not in (None, "success")):
+        text = res.get("result") if isinstance(res.get("result"), str) else ""
+        return bool(AUTH_TEXT_RE.search(text or "")) or res.get("api_error_status") in (401, 403)
+    return res is None and bool(AUTH_TEXT_RE.search(err_txt))
+
+
+def _auth_message(self, res: Optional[Dict[str, Any]], err_txt: str) -> str:
+    detail = next((e for e in self.retry_errors if e in AUTH_RETRY_ERRORS), None)
+    if detail is None and res is not None:
+        detail = (res.get("result") if isinstance(res.get("result"), str) else "")[:120] or f"HTTP {res.get('api_error_status')}"
+    if detail is None:
+        detail = _first_line(err_txt, "login") if err_txt else "login required"
+    return (f"Claude CLI 無法使用目前的登入或帳號（{detail}）。本工具不會自動改用 API Key 計費、不會修改 Claude 設定，"
+            "也不會加入 --bare。請在原生 Claude 執行 /login 或檢查帳號／組織狀態後重試。")
+
+
+ClaudeParser._auth_problem = _auth_problem  # type: ignore[attr-defined]
+ClaudeParser._auth_message = _auth_message  # type: ignore[attr-defined]
 
 
 def _diag_unknown(self) -> List[str]:
@@ -166,6 +270,8 @@ class ClaudeAdapter(Adapter):
         args = ["-p", "--output-format", "stream-json", "--verbose"]
         if req.session_id:
             args += ["--resume", req.session_id]
+            if req.fork:
+                args += ["--fork-session"]        # official: copy the history into a NEW session, original untouched
         else:
             # we choose the id, so it is known (and saved) before the CLI even starts
             req_sid = self.new_session_id()
@@ -188,10 +294,3 @@ class ClaudeAdapter(Adapter):
 
     def make_parser(self, req: TurnRequest, on_session: Callable[[str], None]) -> Parser:
         return ClaudeParser(req, on_session, req.schema is not None)
-
-    def run(self, req, cancel, on_session, on_raw=None):  # type: ignore[override]
-        res = super().run(req, cancel, on_session, on_raw)
-        if req.session_id and res.session_id and res.session_id != req.session_id and res.ok:
-            return TurnResult(False, error=f"CLI continued a different session ({res.session_id}) than requested ({req.session_id})",
-                              error_kind="session_lost", session_id=req.session_id)
-        return res

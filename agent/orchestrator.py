@@ -2,20 +2,21 @@
 agent CLI turns run in short-lived worker threads that only post results back to the loop."""
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from . import compat, protocol, runner
 from .adapters import get_adapter
 from .adapters.base import Adapter, TurnRequest, TurnResult
 from .config import AgentCfg, Config
 from .snapshot import FileDiff, diff_snapshots, take_snapshot
-from .store import Store
+from .store import Store, redact
 from .ui import UI
 
 
@@ -65,6 +66,9 @@ class Running:
     lines: int = 0               # raw lines seen (display / tests)
     warn_basis: float = -1.0     # last_output value the silence timer was armed for
     next_warn: float = 0.0       # engine clock at which the next "no new output" notice is due
+    req_model: Optional[str] = None     # model WE asked the CLI for in this turn (not necessarily what ran)
+    req_effort: Optional[str] = None
+    turn_id: str = ""
 
 
 @dataclass
@@ -79,6 +83,8 @@ class AgentRT:
     repair_used: bool = False
     active_task: Optional[str] = None
     turns: int = 0
+    inflight: List[Dict[str, Any]] = field(default_factory=list)   # mail handed to the CLI turn that is running now
+    last_turn: Optional[Dict[str, Any]] = None                     # turn info (model facts) of the newest finished turn
 
     @property
     def role(self) -> str:
@@ -107,10 +113,57 @@ def fmt_quiet(sec: float) -> str:
     return f"{sec} 秒" if sec < 120 else f"{sec // 60} 分 {sec % 60:02d} 秒"
 
 
+def turn_info(a: "AgentRT", turn_id: str, requested: Optional[str], effort: Optional[str],
+              res: Optional[TurnResult]) -> Dict[str, Any]:
+    """Model facts of ONE turn. `reported` = the CLI said so; `requested` = we asked for it; neither = unknown.
+    Requested is never promoted to reported."""
+    reported = res.model_reported if res else None
+    models = list(res.models_all) if res else []
+    source = "reported" if reported else ("requested" if requested else "unknown")
+    return {"turn": turn_id, "agent": a.id, "cli": a.cfg.cli, "requested": requested, "effort": effort,
+            "reported": reported, "models": models, "source": source}
+
+
+def model_label(info: Dict[str, Any]) -> str:
+    if info["source"] == "reported":
+        extra = f" +{len(info['models']) - 1}" if len(info.get("models") or []) > 1 else ""
+        return f"{info['reported']}{extra}（CLI 回報）"
+    if info["source"] == "requested":
+        return f"要求使用 {info['requested']}（CLI 未確認）"
+    return "模型未知（CLI 未回報）"
+
+
+ERROR_HINTS = {
+    "session_lost": "該 Session 已不存在或與要求的不一致（可能超過 CLI 保留期限、被刪除，或 CLI 改用了別的 Session）；"
+                    "本工具不會自動改用新 Session，也不會覆寫已保存的 Session ID",
+    "session_busy": "該 Claude Session 正在背景或另一個程序中執行；請先在原生 Claude 結束或 attach 它，本工具不會強行寫入同一個 Session",
+    "fork_failed": "Fork 沒有產生新的 Session，結果已捨棄，原 Session 未被使用",
+}
+
+
+def _mail_text(m: Dict[str, Any]) -> str:
+    return str(m.get("text", ""))
+
+
+def _redact_obj(o: Any) -> Any:
+    """Secret-redact every string inside a JSON-able structure (state.json is not a log, but it must not keep tokens)."""
+    if isinstance(o, str):
+        return redact(o)
+    if isinstance(o, list):
+        return [_redact_obj(x) for x in o]
+    if isinstance(o, dict):
+        return {k: _redact_obj(v) for k, v in o.items()}
+    return o
+
+
+def _clean_mail(lst: Any) -> List[Dict[str, Any]]:
+    return [dict(m) for m in (lst if isinstance(lst, list) else []) if isinstance(m, dict) and isinstance(m.get("kind"), str)]
+
+
 class Engine:
     def __init__(self, cfg: Config, store: Store, ui: UI, cwd: str,
                  adapter_factory: Callable[[AgentCfg], Adapter] = get_adapter,
-                 clock: Callable[[], float] = time.monotonic, watch_tick: float = 1.0):
+                 clock: Callable[[], float] = time.monotonic, watch_tick: float = 1.0, resume: bool = False):
         self.cfg, self.store, self.ui, self.cwd = cfg, store, ui, cwd
         self.clock = clock                 # elapsed-time source; tests inject a fake one
         self._tick = watch_tick            # how often the idle loop re-checks for silent turns
@@ -131,10 +184,160 @@ class Engine:
         self._stopped = False
         self.transitions_log: List[str] = []
         self.cli_versions: Dict[str, Dict[str, Any]] = {}
-        store.update(cwd=cwd, state=self.state.value)
-        for a in self.agents.values():
-            store.set_agent(a.id, role=a.role, cli=a.cfg.cli, model=a.cfg.model, effort=a.cfg.effort,
-                            session_id=None)
+        self.on_tick: Optional[Callable[[], None]] = None   # called on every idle tick (the session-lock heartbeat)
+        self.hold = False                              # after a resume: nothing starts until the user says so
+        self.restore_report: List[str] = []            # what the resume found; the caller prints it through its UI
+        self._cur_turn: Optional[Dict[str, Any]] = None
+        self._model_seen: Dict[str, str] = {}
+        self._persisted = ""
+        store.update(cwd=cwd, version=2,
+                     config={"manager": cfg.manager,
+                             "agents": {aid: {"role": a.role, "cli": a.cfg.cli, "model": a.cfg.model,
+                                              "effort": a.cfg.effort} for aid, a in self.agents.items()}})
+        if resume:
+            self._restore()
+        else:
+            store.update(state=self.state.value)
+            for a in self.agents.values():
+                store.set_agent(a.id, role=a.role, cli=a.cfg.cli, model=a.cfg.model, effort=a.cfg.effort,
+                                session_id=None, preamble_sent=False)
+
+    # ------------------------------------------------------------ persistence / resume
+    def _persist(self) -> None:
+        """Write the transient queues to state.json so a restart cannot lose them. Called after every event that
+        the loop handled (low frequency, never per CLI line) and only writes when something changed."""
+        snap = {"agents": {aid: {"inbox": a.inbox, "inflight": a.inflight, "active_task": a.active_task,
+                                 "repair_used": a.repair_used} for aid, a in self.agents.items()},
+                "held": self.held, "pending_notes": self.pending_notes}
+        snap = _redact_obj(snap)
+        key = json.dumps(snap, sort_keys=True, ensure_ascii=False)
+        if key != self._persisted:
+            self._persisted = key
+            self.store.update(mail=snap)
+
+    def _agents_with_ok_turn(self) -> Set[str]:
+        return {r.get("agent") for r in Store.iter_events(self.store.dir)
+                if r.get("type") == "turn_end" and r.get("ok") is True}
+
+    def _restore(self) -> None:
+        """Rebuild runtime state from a saved session (see Store.open_existing). Rules:
+        - session ids and preamble_sent come back as saved, so a successful preamble is never sent twice;
+        - a turn that was running when the old process ended has an UNKNOWN outcome: it is never treated as done and
+          never re-run. Worker tasks become `interrupted`, the user is told which of their messages were in flight;
+        - queued messages / worker reports / notes come back and wait (`hold`) until the user says /continue or types;
+        - a pending ask_user question comes back with the held mail behind it."""
+        st = self.store.state
+        rep: List[Tuple[str, str]] = self.restore_report
+        legacy = (self.store.loaded_version or 1) < 2
+        mail = st.get("mail") if isinstance(st.get("mail"), dict) else {}
+        magents = mail.get("agents") if isinstance(mail.get("agents"), dict) else {}
+        saved = st.get("agents") if isinstance(st.get("agents"), dict) else {}
+        ok_turns: Optional[Set[str]] = None
+        for aid, a in self.agents.items():
+            info = saved.get(aid) if isinstance(saved.get(aid), dict) else {}
+            a.session_id = info["session_id"] if isinstance(info.get("session_id"), str) else None
+            if isinstance(info.get("preamble_sent"), bool):
+                a.preamble_sent = info["preamble_sent"]
+            else:                                       # version 1 never saved it: infer from the turn log
+                if ok_turns is None:
+                    ok_turns = self._agents_with_ok_turn()
+                a.preamble_sent = bool(a.session_id) and aid in ok_turns
+            a.turns = info["turns"] if isinstance(info.get("turns"), int) else 0
+            if isinstance(info.get("last_model"), str):
+                self._model_seen[aid] = info["last_model"]
+            if isinstance(info.get("last_turn"), dict):
+                a.last_turn = info["last_turn"]
+            am = magents.get(aid) if isinstance(magents.get(aid), dict) else {}
+            a.inbox = _clean_mail(am.get("inbox"))
+            a.inflight = _clean_mail(am.get("inflight"))
+            a.active_task = am["active_task"] if isinstance(am.get("active_task"), str) else None
+            a.repair_used = bool(am.get("repair_used"))
+        self.held = _clean_mail(mail.get("held"))
+        self.pending_notes = [str(x) for x in (mail.get("pending_notes") or []) if isinstance(x, str)]
+        au = st.get("awaiting_user")
+        self.awaiting_user = au if isinstance(au, dict) and au.get("text") else None
+        self.store.update(awaiting_user=self.awaiting_user)
+
+        rep.append(("system", f"已恢復 Session {self.store.id}（上次狀態：{st.get('state') or '未知'}）。"))
+        if legacy:
+            rep.append(("system", "這是舊版（v1）Session：排隊中的暫存訊息當時沒有保存，無法恢復；"
+                                  "preamble 狀態由事件紀錄推測。"))
+        # 1. turns that were running when the old process ended
+        lost = [_mail_text(m) for m in self.mgr.inflight if m["kind"] in ("user", "user_answer")]
+        if self.mgr.inflight:
+            self.pending_notes.append(
+                "The agent program was stopped while you were handling the previous input. How far you got is UNKNOWN; "
+                "nothing was re-run automatically and files were NOT rolled back. Do not assume it completed; "
+                "if it matters, check the actual state or ask the user.")
+        if lost:
+            rep.append(("system", "上次中斷時 Manager 正在處理你的下列訊息，結果未知，不會自動重做；"
+                                  "需要的話請重新送出：\n" + "\n".join("  - " + t[:120] for t in lost)))
+        elif self.mgr.inflight:
+            rep.append(("system", "上次中斷時 Manager 正在處理一則系統通知，結果未知，不會自動重做。"))
+        self.mgr.inflight = []
+        broken: List[str] = []
+        for wid in self.worker_ids:
+            w = self.agents[wid]
+            if w.inflight:
+                tid = w.active_task or next((m.get("task_id") for m in w.inflight if m.get("task_id")), None)
+                if tid and tid in self.tasks and self.tasks[tid].get("status") in protocol.OPEN_TASK_STATES:
+                    self.store.set_task(tid, status="interrupted")
+                    broken.append(f"{tid}（{wid}）")
+                w.inflight = []
+                w.active_task = None
+        # 2. open tasks nothing in the saved queues can still drive: unfinished with unknown outcome
+        backed = {m.get("task_id") for wid in self.worker_ids for m in self.agents[wid].inbox if m.get("task_id")}
+        backed |= {m.get("task_id") for m in self.mgr.inbox + self.held if m.get("kind") == "worker"}
+        for tid, t in self.tasks.items():
+            if t.get("status") in protocol.OPEN_TASK_STATES and tid not in backed:
+                self.store.set_task(tid, status="interrupted")
+                broken.append(f"{tid}（{t.get('worker')}）")
+        for wid in self.worker_ids:
+            if self.agents[wid].active_task and self.tasks.get(self.agents[wid].active_task, {}).get("status") == "interrupted":
+                self.agents[wid].active_task = None
+        if broken:
+            rep.append(("system", "這些任務在上次結束時尚未完成，已標記為 interrupted；檔案不會自動還原，也不會自動重跑："
+                                  + "、".join(broken)))
+            self.pending_notes.append(
+                "After a restart of the agent program these tasks were found unfinished and are now marked interrupted: "
+                + ", ".join(broken) + ". Workers were stopped; files were NOT rolled back; nothing was re-run. "
+                "Do not assume any of it completed.")
+        # 3. what waits for the user
+        queued = [_mail_text(m) for a in self.agents.values() for m in a.inbox if m["kind"] in ("user", "user_answer")]
+        n_mail = sum(len(a.inbox) for a in self.agents.values())
+        if n_mail:
+            self.hold = True
+            rep.append(("system", f"保留了 {n_mail} 項尚未處理的訊息／任務／通知"
+                                  + ("（含你的訊息：" + " | ".join(t[:40] for t in queued[:3]) + "）" if queued else "")
+                                  + "，目前暫停。輸入 /continue 開始處理，直接輸入新訊息（會排在它們之後），或 /interrupt 丟棄。"))
+        if self.awaiting_user:
+            rep.append(("ask_user", self.awaiting_user["text"]))
+            if self.held:
+                rep.append(("system", f"另有 {len(self.held)} 項訊息在這個問題之後等待，會在你回答後依序送給 Manager。"))
+        if self.pending_notes and not (n_mail or self.awaiting_user):
+            rep.append(("system", "下一則你輸入的訊息會附帶上述中斷說明給 Manager。"))
+        self._settle_restore()
+        self.store.log("session_restored", legacy=legacy, hold=self.hold, interrupted=broken, lost_user=lost,
+                       awaiting=bool(self.awaiting_user))
+        self._persist()
+
+    def _settle_restore(self) -> None:
+        """Pick the starting state from what was restored (the normal transition table starts at idle)."""
+        busy_worker = bool([t for t in self.tasks.values() if t["status"] in protocol.OPEN_TASK_STATES])
+        if self.awaiting_user:
+            target = State.WAITING_USER
+        elif self.mgr.inbox:
+            target = State.WAITING_MANAGER
+        elif busy_worker or any(self.agents[w].inbox for w in self.worker_ids):
+            target = State.WAITING_WORKER
+        else:
+            target = State.IDLE
+        self.state = target
+        self.store.update(state=target.value)
+
+    def release(self) -> None:
+        """/continue: let the work that a resume kept on hold start."""
+        self._events.put(("release",))
 
     # ------------------------------------------------------------ public API (thread-safe)
     def start(self) -> None:
@@ -148,6 +351,8 @@ class Engine:
         self._events.put(("interrupt",))
 
     def shutdown(self) -> None:
+        if self._stopped or (self._thread is not None and not self._thread.is_alive()):
+            return                                       # already shut down: calling it again must not wait
         done = threading.Event()
         self._events.put(("stop", done))
         done.wait(30)
@@ -157,7 +362,7 @@ class Engine:
     def is_quiescent(self) -> bool:
         with self._lock:
             return (self._events.unfinished_tasks == 0 and all(a.running is None for a in self.agents.values())
-                    and not any(a.inbox for a in self.agents.values()))
+                    and (self.hold or not any(a.inbox for a in self.agents.values())))
 
     def wait_idle(self, timeout: float = 60.0) -> bool:
         end = time.monotonic() + timeout
@@ -209,9 +414,15 @@ class Engine:
                      f"manager turns this input: {self.manager_turns}/{self.cfg.max_manager_turns_per_input}"]
             for a in self.agents.values():
                 task = f", task={a.active_task}" if a.role == "worker" and a.active_task else ""
+                lt = a.last_turn
+                last = (f", last turn {lt['turn']}: model {model_label(lt)}" if lt else "")
                 lines.append(f"  {a.id} ({a.role}, {a.cfg.cli}) {self._activity(a)}{task}, queued={len(a.inbox)}, "
                              f"model={a.cfg.model or 'default'}, effort={a.cfg.effort or 'default'}, "
-                             f"session={a.session_id or '-'}")
+                             f"session={a.session_id or '-'}{last}")
+            if self.hold:
+                n = sum(len(a.inbox) for a in self.agents.values())
+                lines.append(f"  on hold after resume: {n} queued item(s). /continue processes them, "
+                             "typing a message queues behind them, /interrupt discards them")
             for aid, v in self.cli_versions.items():
                 lines.append(f"  cli {aid}: {v['cli']} {v['version'] or '?'} [{v['status']}] {v['note']}".rstrip())
             open_t = [f"{tid}:{t['status']}@{t['worker']}" for tid, t in self.tasks.items()
@@ -247,6 +458,10 @@ class Engine:
             self.store.log("internal_error", trace=traceback.format_exc())
 
     @staticmethod
+    def _display(a: AgentRT) -> str:
+        return "Manager" if a.role == "manager" else a.id
+
+    @staticmethod
     def _label(a: AgentRT, short: bool = False) -> str:
         name = "Manager" if a.role == "manager" else a.id
         return name if short else f"{name} ({a.cfg.cli})"
@@ -258,6 +473,11 @@ class Engine:
                 evt = self._events.get(timeout=self._tick)
             except queue.Empty:
                 self.check_silence()
+                if self.on_tick:
+                    try:
+                        self.on_tick()
+                    except Exception:
+                        pass
                 continue
             try:
                 with self._lock:
@@ -272,8 +492,12 @@ class Engine:
                         self._on_interrupt()
                     elif kind == "turn_done":
                         self._on_turn_done(evt[1])
+                    elif kind == "release":
+                        self._on_release()
                     self._pump()
                     self._settle()
+                    self._cur_turn = None
+                    self._persist()
             except Exception:  # never let the loop die silently
                 tb = traceback.format_exc()
                 self.store.log("internal_error", trace=tb)
@@ -315,8 +539,27 @@ class Engine:
 
     # ------------------------------------------------------------ helpers
     def _say(self, sender: str, text: str, to: Optional[str] = None) -> None:
-        self.store.log("chat", sender=sender, to=to, text=text)
-        self.ui.chat(sender, text, to)
+        meta = self._cur_turn
+        if meta is not None and sender != self._display(self.agents[meta["agent"]]):
+            meta = None                                # e.g. "Me": only the turn's own agent speaks with its model
+        if meta:
+            self._announce_model(meta)
+        self.store.log("chat", sender=sender, to=to, text=text, **({"turn": meta} if meta else {}))
+        self.ui.chat(sender, text, to, meta)
+
+    def _announce_model(self, info: Dict[str, Any]) -> None:
+        """Say which model produced this turn - once per turn, and only when it differs from what that agent showed
+        last time. The label comes from this turn's own facts, never from the current config."""
+        if info.get("announced"):
+            return
+        info["announced"] = True
+        a = self.agents[info["agent"]]
+        label = model_label(info)
+        prev = self._model_seen.get(a.id)
+        if label != prev:
+            self._model_seen[a.id] = label
+            self.store.set_agent(a.id, last_model=label)
+            self.ui.system(f"{self._display(a)} · {a.cfg.cli} · " + ("模型變更：" if prev else "") + label)
 
     def _team_view(self) -> protocol.TeamView:
         return protocol.TeamView(
@@ -338,6 +581,7 @@ class Engine:
         if not text:
             return
         self.store.log("chat", sender="Me", to="Manager", text=text)
+        self.hold = False                              # typing counts as "go ahead" after a resume
         self.manager_turns = 0
         mail: List[Dict[str, Any]] = []
         for n in self.pending_notes:
@@ -355,6 +599,16 @@ class Engine:
             mail.append({"kind": "user", "text": text})
         self.mgr.inbox.extend(mail)
 
+    def _on_release(self) -> None:
+        if not self.hold:
+            self.ui.system("沒有被暫停的項目。")
+            return
+        self.hold = False
+        if self.mgr.inbox and self.pending_notes:       # the Manager is about to run: tell it what happened first
+            self.mgr.inbox[0:0] = [{"kind": "system", "text": n} for n in self.pending_notes]
+            self.pending_notes.clear()
+        self.ui.system("開始處理上次保留的項目。")
+
     def _cancel_all(self) -> None:
         self.epoch += 1
         running = [a for a in self.agents.values() if a.running]
@@ -370,8 +624,10 @@ class Engine:
             if t["status"] in protocol.OPEN_TASK_STATES:
                 self.store.set_task(tid, status=task_status)
                 closed.append(tid)
+        self.hold = False
         for a in self.agents.values():
             a.inbox.clear()
+            a.inflight = []
             a.repair_used = False
             if a.role == "worker":
                 a.active_task = None
@@ -412,11 +668,12 @@ class Engine:
         runner.kill_all()
         self.store.log("shutdown", state=self.state.value)
         self.store.update(state=self.state.value, awaiting_user=self.awaiting_user)
+        self._persist()              # queues + the turns that were cut off stay on disk for `agent resume`
         self._stopped = True
 
     # ------------------------------------------------------------ turn launching
     def _pump(self) -> None:
-        if self._stopped:
+        if self._stopped or self.hold:
             return
         for a in self.agents.values():
             if a.running is None and a.inbox:
@@ -472,9 +729,12 @@ class Engine:
                               name=f"turn-{a.id}")
         kinds = {m["kind"] for m in mails}
         t0 = self.clock()
-        a.running = Running(th, cancel, epoch, t0=t0, last_output=t0)
         a.turns += 1
+        a.inflight = list(mails)
+        a.running = Running(th, cancel, epoch, t0=t0, last_output=t0, req_model=model, req_effort=effort,
+                            turn_id=f"{a.id}#{a.turns}")
         self.store.log("turn_start", agent=a.id, epoch=epoch, session=sid, model=model, effort=effort,
+                       turn=f"{a.id}#{a.turns}",
                        prompt_chars=len(prompt), resumed=sid is not None)
         self._announce_start(a, kinds)
         th.start()
@@ -525,13 +785,20 @@ class Engine:
         if d.epoch != self.epoch:
             return  # belongs to work that was interrupted/aborted
         a = self.agents[d.agent_id]
-        a.running = None
+        run, a.running = a.running, None
+        a.inflight = []
         res = d.res
+        info = turn_info(a, run.turn_id if run else f"{a.id}#{a.turns}", run.req_model if run else None,
+                         run.req_effort if run else None, res)
+        a.last_turn = info
+        self._cur_turn = info
         self.store.log("turn_end", agent=a.id, ok=res.ok, error_kind=res.error_kind, error=res.error, notes=res.notes,
                        exit_code=res.exit_code, mode=res.mode, killed_with=res.killed_with,
-                       denials=res.denials, files=d.diff.to_dict() if d.diff else None)
+                       denials=res.denials, files=d.diff.to_dict() if d.diff else None, turn=info, cli_meta=res.meta)
         if res.ok:
             a.preamble_sent = True
+        self.store.set_agent(a.id, preamble_sent=a.preamble_sent, turns=a.turns, last_turn=info,
+                             **({"cli_meta": res.meta} if res.meta else {}))
         if not res.ok:
             self._on_agent_error(a, res)
             return
@@ -592,6 +859,9 @@ class Engine:
             v = self.cli_versions.get(a.id) or {}
             res.error = (f"{res.error} [CLI 輸出格式可能已更新；{a.cfg.cli} 版本 {v.get('version') or '未知'}。"
                          "請回報此錯誤與版本，程式不會猜測未知格式。]")
+        hint = ERROR_HINTS.get(kind)
+        if hint:
+            res.error = f"{res.error} [{hint}]"
         if a.role == "worker":
             ev = ""
             status = "timeout" if kind == "timeout" else "failed"

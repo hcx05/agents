@@ -20,6 +20,7 @@ class TurnRequest:
     effort: Optional[str] = None
     schema: Optional[Dict[str, Any]] = None
     timeout: float = 1800
+    fork: bool = False                 # resume session_id as a COPY (--fork-session); only the first turn of an import
 
 
 @dataclass
@@ -36,7 +37,7 @@ class TurnResult:
     session_id: Optional[str] = None
     error: Optional[str] = None
     # not_found|start_failed|timeout|cancelled|session_lost|model_invalid|effort_invalid|
-    # unsupported|cli_error|no_output|exit|unknown_format
+    # unsupported|cli_error|no_output|exit|unknown_format|session_busy|auth_error|fork_failed
     # (unknown_format: the CLI's output no longer looks like what this adapter understands; never guessed at)
     error_kind: Optional[str] = None
     denials: List[str] = field(default_factory=list)
@@ -44,6 +45,9 @@ class TurnResult:
     mode: str = ""
     killed_with: Optional[str] = None
     notes: List[str] = field(default_factory=list)   # harmless oddities seen (unfamiliar event types...); logged only
+    model_reported: Optional[str] = None             # model the CLI itself said it used in THIS turn (None = not reported)
+    models_all: List[str] = field(default_factory=list)   # every distinct model id the CLI reported this turn
+    meta: Dict[str, Any] = field(default_factory=dict)    # optional CLI metadata (version, auth source...), never required
 
 
 class Parser:
@@ -57,6 +61,10 @@ class Parser:
 
     def diagnostics(self) -> List[str]:
         return []
+
+    def reported(self) -> Dict[str, Any]:
+        """Facts the CLI itself reported this turn: {"model": str|None, "models": [...], "meta": {...}}."""
+        return {}
 
 
 class Adapter:
@@ -130,6 +138,10 @@ class Adapter:
             return TurnResult(False, error=f"could not start CLI: {proc.start_error}", error_kind="start_failed")
         res = parser.finish(proc)
         res.notes = parser.diagnostics()
+        rep = parser.reported()
+        res.model_reported = rep.get("model")
+        res.models_all = list(rep.get("models") or [])
+        res.meta = dict(rep.get("meta") or {})
         res.exit_code = proc.exit_code
         if proc.status == "timeout":
             res.ok, res.error_kind = False, "timeout"

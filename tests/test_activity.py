@@ -37,7 +37,7 @@ class TestStartLines(Base):
         self.rig = r = Rig({"manager": [M([final("好了")])], "w1": []})
         r.say("你好")
         sys_lines = r.ui.texts("system")
-        self.assertEqual(sys_lines, ["Manager (fake) 開始執行。"])
+        self.assertEqual(sys_lines, ["Manager (fake) 開始執行。", "Manager · fake · fake-default（CLI 回報）"])
         self.assertEqual(r.chat_lines(), ["Manager> @Me 好了"])
 
     def test_dispatch_flow_is_one_chronological_timeline(self):

@@ -28,7 +28,7 @@ def enable_vt() -> bool:
 class UI:
     """Base UI; also the no-op interface the engine talks to."""
 
-    def chat(self, sender: str, text: str, to: Optional[str] = None) -> None: ...
+    def chat(self, sender: str, text: str, to: Optional[str] = None, meta: Optional[dict] = None) -> None: ...
     def system(self, text: str) -> None: ...
     def error(self, text: str) -> None: ...
     def ask_user(self, text: str) -> None: ...
@@ -39,19 +39,58 @@ class BufferUI(UI):
 
     def __init__(self) -> None:
         self.lines: List[Tuple[str, str, str, Optional[str]]] = []
-        self._lock = threading.Lock()
+        self.metas: dict = {}                              # line index -> turn metadata of that chat line
+        self._lock = threading.RLock()
 
     def _add(self, kind: str, sender: str, text: str, to: Optional[str] = None) -> None:
         with self._lock:
             self.lines.append((kind, sender, text, to))
 
-    def chat(self, sender, text, to=None): self._add("chat", sender, text, to)
+    def chat(self, sender, text, to=None, meta=None):
+        with self._lock:
+            if meta is not None:
+                self.metas[len(self.lines)] = meta        # index of the line _add is about to append
+        self._add("chat", sender, text, to)
     def system(self, text): self._add("system", "system", text)
     def error(self, text): self._add("error", "system", text)
     def ask_user(self, text): self._add("ask_user", "Manager", text, "Me")
 
     def texts(self, kind: Optional[str] = None, sender: Optional[str] = None) -> List[str]:
         return [t for k, s, t, _ in self.lines if (kind is None or k == kind) and (sender is None or s == sender)]
+
+
+class RecordingUI(UI):
+    """Wraps any UI and persists what the engine does NOT already log: system notices and errors, as `ui` events in
+    the session's events.jsonl (global `seq` keeps them ordered against chat / ask_user events). Chat lines and
+    ask_user are logged by the engine itself, so they are only forwarded here: nothing is recorded twice. Text goes
+    through Store.log, i.e. the normal secret redaction."""
+
+    def __init__(self, inner: UI, store) -> None:
+        self.inner = inner
+        self.store = store
+
+    def chat(self, sender, text, to=None, meta=None):
+        self.inner.chat(sender, text, to, meta)
+
+    def system(self, text):
+        self._record("system", text)
+        self.inner.system(text)
+
+    def error(self, text):
+        self._record("error", text)
+        self.inner.error(text)
+
+    def ask_user(self, text):
+        self.inner.ask_user(text)
+
+    def _record(self, kind: str, text: str) -> None:
+        try:
+            self.store.log("ui", kind=kind, text=text)
+        except Exception:
+            pass                                      # a logging problem must never break the chat
+
+    def __getattr__(self, name):                      # banner(), read_line(), ... of the wrapped UI
+        return getattr(self.inner, name)
 
 
 class ChatUI(UI):
@@ -83,7 +122,7 @@ class ChatUI(UI):
                 self.out.write(self.prompt_text)
             self.out.flush()
 
-    def chat(self, sender: str, text: str, to: Optional[str] = None) -> None:
+    def chat(self, sender: str, text: str, to: Optional[str] = None, meta: Optional[dict] = None) -> None:
         tag = f"@{to} " if to else ""
         self._emit(f"{sender}> {tag}", text, sender)
 

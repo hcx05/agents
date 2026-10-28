@@ -5,7 +5,9 @@ Mimics `claude -p --output-format stream-json --verbose` closely enough for the 
 Env: FAKE_SCENARIO (json: {"<agent id>": [step, ...]}), FAKE_STATE (dir for counters/sessions/calls).
 Step keys: reply(obj) | text(str) | sleep(sec) | exit(code) | stderr(str) | raw_stdout([str]) |
            denial([{tool_name,tool_input}]) | expect_prompt_contains([str]) | expect_turn(int) |
-           write_file({path,content}) | is_error(str) | forget_sessions_of(agent id) | wait_for_file(path relative to cwd)
+           write_file({path,content}) | is_error(str) | forget_sessions_of(agent id) | wait_for_file(path relative to cwd) |
+           report_model(str: init.model) | omit_model(bool) | assistant_model(str) | api_retry_error(str) |
+           fork_keeps_id(bool: --fork-session "forgets" to create a new session)
 """
 import json
 import os
@@ -22,7 +24,7 @@ def out(obj):
 
 
 def parse(argv):
-    o = {"session_id": None, "resume": None, "model": None, "effort": None, "agent": "?", "schema": None}
+    o = {"session_id": None, "resume": None, "model": None, "effort": None, "agent": "?", "schema": None, "fork": False}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -31,9 +33,24 @@ def parse(argv):
                    "--fake-agent": "agent", "--json-schema": "schema", "--output-format": "fmt"}[a]
             o[key] = argv[i + 1]
             i += 2
+        elif a == "--fork-session":
+            o["fork"] = True
+            i += 1
         else:
             i += 1
     return o
+
+
+def peek_step(state, agent):
+    """The scenario step the NEXT call of this agent will use (without consuming it); {} when none."""
+    try:
+        scen = json.load(open(os.environ["FAKE_SCENARIO"], encoding="utf-8"))
+        cpath = os.path.join(state, f"counter_{agent}.txt")
+        n = int(open(cpath).read()) if os.path.exists(cpath) else 0
+        steps = scen.get(agent, [])
+        return steps[n] if n < len(steps) else {}
+    except (OSError, ValueError, KeyError):
+        return {}
 
 
 def main():
@@ -49,6 +66,7 @@ def main():
 
     sid = opts["resume"] or opts["session_id"] or str(uuid.uuid4())
     spath = os.path.join(state, "sessions", sid + ".json")
+    pstep = peek_step(state, agent)
     if opts["resume"]:
         if not os.path.exists(spath):
             print(f"No conversation found with session ID: {sid}")
@@ -56,6 +74,11 @@ def main():
                  "errors": [f"No conversation found with session ID: {sid}"]})
             return 1
         sess = json.load(open(spath, encoding="utf-8"))
+        if opts["fork"] and not pstep.get("fork_keeps_id"):
+            # official behaviour: the history is COPIED into a new session, the original file stays untouched
+            sid = str(uuid.uuid4())
+            sess = dict(sess, forked_from=opts["resume"])
+            spath = os.path.join(state, "sessions", sid + ".json")
     else:
         sess = {"turns": 0, "agent": agent}
     sess["turns"] += 1
@@ -67,7 +90,13 @@ def main():
                             "has_schema": opts["schema"] is not None, "prompt": prompt,
                             "argv": sys.argv[1:]}, ensure_ascii=False) + "\n")
 
-    out({"type": "system", "subtype": "init", "session_id": sid, "model": opts["model"] or "fake-default"})
+    init = {"type": "system", "subtype": "init", "session_id": sid}
+    if not pstep.get("omit_model"):
+        init["model"] = pstep.get("report_model") or opts["model"] or "fake-default"
+    out(init)
+    if pstep.get("api_retry_error"):
+        out({"type": "system", "subtype": "api_retry", "session_id": sid, "attempt": 1, "max_retries": 3,
+             "retry_delay_ms": 10, "error_status": 401, "error": pstep["api_retry_error"]})
     if opts["effort"] and opts["effort"] not in EFFORTS:
         sys.stderr.write(f"Warning: Unknown --effort value '{opts['effort']}' — ignoring it. Valid values: {', '.join(EFFORTS)}.\n")
         sys.stderr.flush()
@@ -136,7 +165,10 @@ def main():
         return 1
     if "reply" in step:
         reply = step["reply"]
-        out({"type": "assistant", "session_id": sid, "message": {"content": [{"type": "text", "text": json.dumps(reply, ensure_ascii=False)}]}})
+        amsg = {"content": [{"type": "text", "text": json.dumps(reply, ensure_ascii=False)}]}
+        if step.get("assistant_model"):
+            amsg["model"] = step["assistant_model"]
+        out({"type": "assistant", "session_id": sid, "message": amsg})
         out({"type": "result", "subtype": "success", "is_error": False, "session_id": sid,
              "result": json.dumps(reply, ensure_ascii=False), "structured_output": reply, "permission_denials": denial})
     else:

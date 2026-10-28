@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+STATE_VERSION = 2
 RAW_LINE_MAX = 2000
 RAW_FILE_MAX = 2 * 1024 * 1024
 
@@ -55,8 +56,12 @@ def atomic_write_json(path: Path, data: Any) -> None:
     raise last  # type: ignore[misc]
 
 
+class StoreError(Exception):
+    pass
+
+
 class Store:
-    def __init__(self, sessions_root: Path, session_id: Optional[str] = None):
+    def __init__(self, sessions_root: Path, session_id: Optional[str] = None, state: Optional[Dict[str, Any]] = None):
         self.id = session_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
         self.dir = sessions_root / self.id
         (self.dir / "raw").mkdir(parents=True, exist_ok=True)
@@ -65,10 +70,78 @@ class Store:
         self._lock = threading.RLock()
         self._seq = 0
         self._raw_sizes: Dict[str, int] = {}
-        self.state: Dict[str, Any] = {
-            "version": 1, "id": self.id, "created": time.time(), "cwd": None, "state": "idle",
+        self.loaded_version: Optional[int] = None      # set when an existing session was opened
+        self.state: Dict[str, Any] = state if state is not None else {
+            "version": STATE_VERSION, "id": self.id, "created": time.time(), "cwd": None, "state": "idle",
             "agents": {}, "tasks": {}, "awaiting_user": None, "manager_turns": 0, "last_error": None,
+            "config": None, "mail": {},
         }
+
+    @classmethod
+    def open_existing(cls, sessions_root: Path, session_id: str) -> "Store":
+        """Open a saved session for resuming. Old (version 1) states are upgraded in memory; nothing is written
+        until the engine saves. A damaged state.json or a half-written last event line never raises past StoreError."""
+        d = Path(sessions_root) / session_id
+        if not (d / "state.json").is_file():
+            raise StoreError(f"session {session_id!r} not found under {sessions_root}")
+        try:
+            st = json.loads((d / "state.json").read_text(encoding="utf-8"))
+            if not isinstance(st, dict):
+                raise ValueError("state.json is not an object")
+        except (OSError, ValueError) as e:
+            raise StoreError(f"state.json of session {session_id!r} is unreadable ({e}); it was not modified")
+        ver = st.get("version", 1)
+        if not isinstance(ver, int) or ver > STATE_VERSION:
+            raise StoreError(f"session {session_id!r} was written by a newer version of agent (state version {ver!r})")
+        for key, default in (("agents", {}), ("tasks", {}), ("mail", {}), ("config", None)):
+            if not isinstance(st.get(key), type(default)) and not (default is None and st.get(key) is None):
+                st[key] = default
+        store = cls(Path(sessions_root), session_id, state=st)
+        store.loaded_version = ver
+        store.state["version"] = STATE_VERSION
+        store._repair_events_tail()
+        store._seq = max([e.get("seq", 0) for e in cls.read_events(d) if isinstance(e.get("seq"), int)] or [0])
+        for p in (d / "raw").glob("*.jsonl"):
+            try:
+                store._raw_sizes[p.stem] = p.stat().st_size
+            except OSError:
+                pass
+        return store
+
+    def _repair_events_tail(self) -> None:
+        """A crash can leave the last line unterminated; appending to it would glue two records together."""
+        try:
+            with open(self.events_path, "rb+") as f:
+                f.seek(0, os.SEEK_END)
+                if f.tell() == 0:
+                    return
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    f.write(b"\n")
+        except OSError:
+            pass
+
+    @staticmethod
+    def iter_events(session_dir: Path):
+        """Parseable event records in file order. Blank, truncated or non-object lines are skipped."""
+        try:
+            with open(Path(session_dir) / "events.jsonl", "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict):
+                        yield rec
+        except OSError:
+            return
+
+    @staticmethod
+    def read_events(session_dir: Path) -> List[Dict[str, Any]]:
+        return list(Store.iter_events(session_dir))
 
     # -- state
     def save(self) -> None:
@@ -101,6 +174,36 @@ class Store:
         if not sessions_root.exists():
             return []
         return sorted(p.name for p in sessions_root.iterdir() if (p / "state.json").exists())
+
+    @staticmethod
+    def summaries(sessions_root: Path) -> List[Dict[str, Any]]:
+        """One dict per saved session (oldest first) for `agent sessions`. Damaged sessions are listed, not fatal."""
+        from .sessionlock import LOCK_NAME, SessionLock
+        out: List[Dict[str, Any]] = []
+        for sid in Store.list_sessions(sessions_root):
+            d = Path(sessions_root) / sid
+            row: Dict[str, Any] = {"id": sid, "ok": True, "version": None, "updated": None, "cwd": None, "state": None,
+                                   "agents": "", "locked": False, "first": ""}
+            try:
+                st = json.loads((d / "state.json").read_text(encoding="utf-8"))
+                row.update(version=st.get("version", 1), updated=st.get("updated") or st.get("created"),
+                           cwd=st.get("cwd"), state=st.get("state"),
+                           agents="+".join(str(a.get("cli", "?")) for a in (st.get("agents") or {}).values()))
+            except (OSError, ValueError, AttributeError):
+                row["ok"] = False
+            if (d / LOCK_NAME).exists():
+                lk = SessionLock(d).read()
+                try:
+                    from .sessionlock import pid_alive
+                    row["locked"] = bool(lk and isinstance(lk.get("pid"), int) and pid_alive(lk["pid"]))
+                except Exception:
+                    row["locked"] = False
+            for rec in Store.iter_events(d):
+                if rec.get("type") == "chat" and rec.get("sender") == "Me":
+                    row["first"] = str(rec.get("text", "")).replace("\n", " ")[:50]
+                    break
+            out.append(row)
+        return out
 
     # -- logs
     def log(self, type_: str, **fields: Any) -> None:

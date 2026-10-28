@@ -12,10 +12,14 @@ from . import __version__
 from .adapters import get_adapter
 from .config import ConfigError, config_path, ensure_config, home_dir, load_config
 from .orchestrator import Engine
-from .store import Store
-from .ui import ChatUI
+from .resume import check_compat, format_sessions, replay, timeline
+from .sessionlock import SessionLock, SessionLocked
+from .store import Store, StoreError
+from .ui import ChatUI, RecordingUI
 
 HELP_IN_CHAT = "Commands: /status  /interrupt  /exit.  Anything else is sent to the Manager."
+HELP_RESUMED = ("Commands: /status  /continue  /interrupt  /exit.  /continue starts the work that was kept on hold; "
+                "typing a message does too.")
 
 
 def _setup_stdio() -> None:
@@ -54,12 +58,27 @@ def _run_slash(engine: Engine, ui: ChatUI, cmd: str) -> bool:
     elif name == "/interrupt":
         engine.interrupt()
         engine.wait_idle(30)
+    elif name == "/continue":
+        engine.release()
     else:
         ui.system(f"Unknown command {name}. {HELP_IN_CHAT}")
     return False
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
+    return _run_chat(args, None)
+
+
+def cmd_sessions(args: argparse.Namespace) -> int:
+    print(format_sessions(Store.summaries(home_dir() / "sessions"), args.limit))
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    return _run_chat(args, args.session_id)
+
+
+def _run_chat(args: argparse.Namespace, resume_id: Optional[str]) -> int:
     path = Path(args.config) if args.config else None
     try:
         cfg = load_config(path)
@@ -67,6 +86,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
         print(f"Config error: {e}", file=sys.stderr)
         return 2
     cwd = os.getcwd()
+    if resume_id is not None and not (home_dir() / "sessions" / resume_id / "state.json").is_file():
+        print(f"Session {resume_id!r} not found. `agent sessions` lists the saved ones.", file=sys.stderr)
+        return 2
     adapters = {}
     problems = []
     for aid, ac in cfg.agents.items():
@@ -81,16 +103,59 @@ def cmd_chat(args: argparse.Namespace) -> int:
               f"{path or config_path()}", file=sys.stderr)
         return 2
 
-    store = Store(home_dir() / "sessions")
-    ui = ChatUI()
-    engine = Engine(cfg, store, ui, cwd, adapter_factory=lambda ac: adapters[ac.id])
+    root = home_dir() / "sessions"
+    resumed = resume_id is not None
+    if resumed:
+        if not (root / resume_id / "state.json").is_file():
+            print(f"Session {resume_id!r} not found. `agent sessions` lists the saved ones.", file=sys.stderr)
+            return 2
+        lock = SessionLock(root / resume_id)
+        try:
+            lock.acquire()                       # before reading the state: only one writer per session
+        except SessionLocked as e:
+            print(f"Cannot resume {resume_id}: {e}", file=sys.stderr)
+            return 2
+        try:
+            store = Store.open_existing(root, resume_id)
+        except StoreError as e:
+            lock.release()
+            print(f"Cannot resume {resume_id}: {e}", file=sys.stderr)
+            return 2
+        errors, warns = check_compat(cfg, store.state, cwd, here=getattr(args, "here", False))
+        if errors:
+            lock.release()
+            print(f"Cannot resume {resume_id}:\n" + "\n".join("  - " + e for e in errors), file=sys.stderr)
+            return 2
+    else:
+        store = Store(root)
+        lock = SessionLock(store.dir)
+        try:
+            lock.acquire()
+        except SessionLocked as e:               # a brand-new directory should never be locked
+            print(f"Cannot start: {e}", file=sys.stderr)
+            return 2
+        warns = []
+    plain = ChatUI()
+    ui = RecordingUI(plain, store)
+    try:
+        engine = Engine(cfg, store, ui, cwd, adapter_factory=lambda ac: adapters[ac.id], resume=resumed)
+    except Exception:
+        lock.release()
+        raise
+    engine.on_tick = lock.heartbeat
     engine.start()
     mgr = cfg.agents[cfg.manager]
     ui.banner(["Agent Team",
                f"Manager: {adapters[mgr.id].display_name}" + (f" ({mgr.model})" if mgr.model else ""),
                *[f"Worker: {adapters[w.id].display_name} [{w.id}]" + (f" ({w.model})" if w.model else "")
                  for w in cfg.workers],
-               f"Folder: {cwd}", f"Session log: {store.dir}", HELP_IN_CHAT])
+               f"Folder: {cwd}", f"Session log: {store.dir}", HELP_RESUMED if resumed else HELP_IN_CHAT])
+    if resumed:
+        shown = replay(plain, timeline(Store.read_events(store.dir)), getattr(args, "replay", 60))
+        for w in warns:
+            ui.system("注意：" + w)
+        for kind, text in engine.restore_report:
+            (ui.ask_user if kind == "ask_user" else ui.system)(text)
     engine.check_cli_versions()          # background; a slow or failing --version never delays or blocks the chat
     interactive = sys.stdin.isatty()
     exit_code = 0
@@ -122,7 +187,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
         pass
     finally:
         engine.shutdown()
-        ui.system(f"Bye. Session saved: {store.dir}")
+        ui.system(f"Bye. Session saved: {store.dir}" + (f"  (resume with: agent resume {store.id})"))
+        lock.release()
     return exit_code
 
 
@@ -134,6 +200,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"agent {__version__}")
     p.add_argument("--config", help="use this config file instead of %%APPDATA%%\\agent\\config.json")
     sub = p.add_subparsers(dest="command")
+    r = sub.add_parser("sessions", help="list saved Agent sessions")
+    r.add_argument("--limit", type=int, default=20, help="show at most this many (newest)")
+    r.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    r = sub.add_parser("resume", help="continue a saved Agent session (its Manager/Worker CLI sessions and chat history)")
+    r.add_argument("session_id", help="Agent session id (see `agent sessions`)")
+    r.add_argument("--replay", type=int, default=60, help="show the last N earlier chat items first (0 = none)")
+    r.add_argument("--here", action="store_true", help="continue even though the current folder differs from the saved one")
+    r.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     c = sub.add_parser("config", help="create the config file if missing and show its path")
     c.add_argument("--show", action="store_true", help="also print the file contents")
     c.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -145,4 +219,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "config":
         return cmd_config(args)
+    if args.command == "sessions":
+        return cmd_sessions(args)
+    if args.command == "resume":
+        return cmd_resume(args)
     return cmd_chat(args)

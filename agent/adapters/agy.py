@@ -116,6 +116,7 @@ class AgyParser(Parser):
         self.error_event: Optional[str] = None
         self.stderr: List[str] = []
         self.denials: List[str] = []
+        self.models_seen: List[str] = []          # `model` strings agy put in its own events (no field is guaranteed)
         self.unknown_events: Dict[str, int] = {}  # event names beside init/step_update/result: ignored, but reported
         self.unknown_steps: Dict[str, int] = {}
 
@@ -125,6 +126,16 @@ class AgyParser(Parser):
         if self.plain:
             out.append(f"{len(self.plain)} non-JSON stdout line(s)")
         return out
+
+    def reported(self) -> Dict[str, Any]:
+        return {"model": self.models_seen[-1] if self.models_seen else None, "models": list(self.models_seen), "meta": {}}
+
+    def _scan_model(self, scopes) -> None:
+        for scope in scopes:
+            if isinstance(scope, dict):
+                m = scope.get("model")
+                if isinstance(m, str) and m.strip() and m not in self.models_seen:
+                    self.models_seen.append(m.strip())
 
     def _see_session(self, sid: Any) -> None:
         if not isinstance(sid, str) or not sid:
@@ -176,6 +187,7 @@ class AgyParser(Parser):
         # Legacy flat layout (fields beside "event") is still accepted when no inner object exists.
         inner = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else (ev if name == "step_update" else None)
         self._scan_session((ev, inner, ev.get("data"), res))
+        self._scan_model((ev, inner, res))
         if name == "step_update" and inner is not None:
             st = inner.get("step_type")
             if st not in KNOWN_STEPS:
@@ -295,6 +307,8 @@ class AgyAdapter(Adapter):
         mode_opt = self.cfg.options.get("stdin_mode", "auto")   # auto | always | never
         if mode_opt not in ("auto", "always", "never"):
             raise ValueError("options.stdin_mode must be auto|always|never")
+        if req.fork:
+            raise ValueError("agy has no documented fork option; forking is only supported for Claude sessions")
         shim = runner.is_cmd_shim(prefix)
         use_stdin = mode_opt == "always" or (mode_opt == "auto" and (shim or len(req.prompt) > ARGV_PROMPT_LIMIT))
         common: List[str] = ["--output-format", "stream-json"]

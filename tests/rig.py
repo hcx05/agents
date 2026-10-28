@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 from agent.config import parse_config  # noqa: E402
 from agent.orchestrator import Engine  # noqa: E402
 from agent.store import Store  # noqa: E402
-from agent.ui import BufferUI  # noqa: E402
+from agent.ui import BufferUI, RecordingUI  # noqa: E402
 
 
 def M(actions: List[dict], say: str = "", **extra) -> dict:
@@ -86,13 +86,35 @@ class Rig:
                                  **(cfg_extra or {})})
         self.store = Store(self.tmp / "sessions")
         self.ui = BufferUI()
+        self._ui_for_engine = RecordingUI(self.ui, self.store)     # what the real CLI does: system/error lines are logged
         self.clock = clock
         # fake-clock rigs also stop the idle tick: tests drive check_silence() themselves
         kw: Dict[str, Any] = dict(clock=clock, watch_tick=3600.0) if clock else {}
         if watch_tick:
             kw["watch_tick"] = watch_tick
-        self.engine = Engine(self.cfg, self.store, self.ui, str(self.cwd), **kw)
+        self.engine = Engine(self.cfg, self.store, self._ui_for_engine, str(self.cwd), **kw)
         self.engine.start()
+
+    def crash_copy(self) -> Path:
+        """Copy of the session directory as it is on disk RIGHT NOW (what a killed process would leave behind)."""
+        dst = self.tmp / ("crash-" + str(int(time.time() * 1000)))
+        shutil.copytree(self.store.dir, dst, ignore=shutil.ignore_patterns("*.tmp", "session.lock"))
+        return dst
+
+    def resume(self, session_dir: Optional[Path] = None, clock=None, **kw):
+        """Stop the current engine (like /exit) and start a fresh one from the saved session, like `agent resume`.
+        With session_dir (e.g. a crash_copy) the new engine resumes THAT directory."""
+        self.engine.shutdown()
+        root = (session_dir.parent if session_dir else self.store.dir.parent)
+        sid = session_dir.name if session_dir else self.store.id
+        self.store = Store.open_existing(root, sid)
+        self.ui = BufferUI()
+        self._ui_for_engine = RecordingUI(self.ui, self.store)
+        ekw = dict(clock=clock, watch_tick=3600.0) if clock else {}
+        ekw.update(kw)
+        self.engine = Engine(self.cfg, self.store, self._ui_for_engine, str(self.cwd), resume=True, **ekw)
+        self.engine.start()
+        return self.engine
 
     def say(self, text: str, wait: float = 60) -> None:
         self.engine.submit(text)
