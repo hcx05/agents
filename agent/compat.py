@@ -13,13 +13,13 @@ from . import runner
 # listed in the note; "partial" = some paths are known to be unverified. Never put "full compatibility" here.
 KNOWN: Dict[str, Dict[str, Tuple[str, str]]] = {
     "claude": {
-        "2.1.312": ("tested", "Windows: probe suite and chat room (Manager alone, /status, ask_user, /interrupt) passed; "
-                              "real Manager->Worker dispatch not yet recorded"),
+        "2.1.312": ("tested", "Windows: probe suite, chat room (/status, ask_user, /interrupt) and real Manager->agy Worker->"
+                              "Manager dispatch passed; real permission-denial detection not observed"),
     },
     "agy": {
-        "1.4.9": ("partial", "Windows: --version/--help passed; model-dependent probes were paused (quota); invalid-effort "
-                             "classification fixed but not re-run on Windows; permission-denial detection not observed; "
-                             "cross-CLI dispatch untested"),
+        "1.4.9": ("partial", "Windows: JSON events, session resume, stdin streaming, --conversation, --json-schema, interrupt, "
+                             "invalid-effort classification and real Claude Manager->agy Worker->Manager dispatch passed; "
+                             "real permission-denial detection not observed"),
     },
 }
 VERSION_RE = re.compile(r"\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.]+)?")
