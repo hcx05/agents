@@ -565,6 +565,16 @@ class TestAgyErrorClassification(unittest.TestCase):
         ('invalid model selection (--model "gem" --effort "max"): Model has no "max" effort', "effort_invalid"),
         ("Unknown model: nope", "model_invalid"),
         ("backend exploded", "cli_error"),
+        # real agy 1.4.9 (Windows): model echo AND the effort cause in one message -> effort wins
+        ('agy turn status ERROR: invalid model selection (--model "" --effort "not-an-effort"): invalid --effort ...',
+         "effort_invalid"),
+        ('invalid model selection (--model "" --effort "turbo"): invalid --effort "turbo" (valid: low, high)',
+         "effort_invalid"),
+        # echoed `--effort ""` must not turn a bad model into an effort error
+        ('invalid model selection (--model "zzz" --effort ""): model zzz is not recognized', "model_invalid"),
+        ('invalid model selection (--model "zzz" --effort "high")', "model_invalid"),
+        ('Model "gem" does not support effort "high"', "effort_invalid"),
+        ("effort is not adjustable for this model", "effort_invalid"),
     ]
 
     def test_classify_error_table(self):
@@ -629,10 +639,12 @@ class TestAgyViaSubprocess(unittest.TestCase):
 
     def test_error_modes(self):
         for mode, kind in (("effort_err_stderr", "effort_invalid"), ("effort_err_result", "effort_invalid"),
+                           ("real_effort_err_stderr", "effort_invalid"), ("real_effort_err_result", "effort_invalid"),
+                           ("real_model_err_result", "model_invalid"),
                            ("model_err_stderr", "model_invalid"), ("model_err_result", "model_invalid"),
                            ("error_status", "cli_error"), ("no_result", "no_output")):
             res, _, _ = self.run_turn(mode, effort="high" if "effort" in mode else None,
-                                      model="m" if "model" in mode else None)
+                                      model="m" if ("model" in mode or mode.startswith("real_effort")) else None)
             self.assertFalse(res.ok, mode)
             self.assertEqual(res.error_kind, kind, mode + str(res.error))
 

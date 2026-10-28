@@ -34,9 +34,13 @@ DENIAL_RE = re.compile(
     r"|approval (is )?required|permission required"
     r"|(not|cannot be) (allowed|permitted|approved) in (headless|non-?interactive)"
     r"|headless.{0,40}(den|disallow|block))", re.I)
-# agy echoes its own flags inside errors, e.g. `invalid model selection (--model "x" --effort ""): ...`.
-# Those echoes say nothing about which value was bad, so they are removed before classifying.
-ECHOED_FLAG_RE = re.compile(r"--(?:effort|model)(?:\s+(?:\"[^\"]*\"|'[^']*'|[^\s)]+))?", re.I)
+# agy echoes the flags it was given in a parenthetical, e.g. `invalid model selection (--model "x" --effort ""): ...`.
+# That parenthetical says nothing about which value was bad, so only the whole `( --flag value ... )` group is removed.
+# Flags that appear OUTSIDE it are the real cause (`...: invalid --effort "zzz"`) and are kept, with the leading
+# dashes dropped so that wording like "invalid effort" matches.
+ECHOED_FLAG_RE = re.compile(
+    r"\(\s*(?:--(?:effort|model)(?:\s+(?:\"[^\"]*\"|'[^']*'|[^\s)]+))?\s*)+\)", re.I)
+BARE_FLAG_RE = re.compile(r"--(effort|model)\b", re.I)
 EFFORT_ERR_RE = re.compile(
     r"(invalid|unknown|unsupported|unrecognized)\s+effort"
     r"|\bhas no\b.{0,30}\beffort\b"
@@ -79,7 +83,7 @@ def classify_error(text: str) -> str:
     ('model X does not support effort high' is an effort problem)."""
     if SESSION_ERR_RE.search(text):
         return "session_lost"
-    core = ECHOED_FLAG_RE.sub(" ", text)
+    core = BARE_FLAG_RE.sub(r"\1", ECHOED_FLAG_RE.sub(" ", text))
     if EFFORT_ERR_RE.search(core):
         return "effort_invalid"
     if MODEL_ERR_RE.search(core):

@@ -41,6 +41,19 @@ def record(name, status, detail=""):
     print(f"[{status:7}] {name}" + (f" - {detail}" if detail else ""), flush=True)
 
 
+def record_permission(cli, denials, created):
+    """A denial must actually be observed to count as verified. A created file with no denial only shows that this
+    CLI's own settings allowed the write, so denial detection stays UNVERIFIED (status NOT-OBS, not PASS)."""
+    name = f"{cli} permission denial detection"
+    if denials:
+        record(name, "PASS", f"denial observed: {denials}")
+    elif created:
+        record(name, "NOT-OBS", "no denial occurred (file was created): detection is NOT verified; to verify, run in a "
+                                "setting where this CLI really refuses the write and check denials=[...]")
+    else:
+        record(name, "UNKNOWN", "no file and no denial text matched; share the stderr/events so the matcher can be checked")
+
+
 def raw_run(prefix, args, stdin, cwd, timeout=180):
     out, err = [], []
     proc = runner.run_process(prefix + args, stdin, cwd, None, timeout, threading.Event(),
@@ -99,8 +112,7 @@ def probe_claude(prefix, cwd, tests):
         r = ad.run(TurnRequest("probe", "Use a tool to create a file named probe_out.txt containing hi, then reply say=done.",
                                cwd, None, schema=TINY, timeout=180), threading.Event(), lambda s: None)
         created = (Path(cwd) / "probe_out.txt").exists()
-        record("claude permission denial detection", "PASS" if (r.denials or created) else "UNKNOWN",
-               f"denials={r.denials} file_created={created} (a created file just means your CLI allows writes)")
+        record_permission("claude", r.denials, created)
     if "interrupt" in tests:
         probe_interrupt(ad, cwd)
 
@@ -163,8 +175,7 @@ def probe_agy(prefix, cwd, tests):
         r = ad.run(TurnRequest("probe", "Use a tool to create a file named probe_out.txt containing hi, then reply done.",
                                cwd, None, timeout=180), threading.Event(), lambda s: None)
         created = (Path(cwd) / "probe_out.txt").exists()
-        record("agy permission denial detection", "PASS" if (r.denials or created) else "UNKNOWN",
-               f"denials={r.denials} file_created={created} (UNKNOWN = no denial text matched; share stderr)")
+        record_permission("agy", r.denials, created)
     if "interrupt" in tests:
         probe_interrupt(ad, cwd)
 
@@ -230,7 +241,7 @@ def main():
     out.write_text(json.dumps([{"test": n, "status": s, "detail": redact(d)} for n, s, d in RESULTS],
                               indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"\nresults saved: {out}")
-    return 0 if all(s in ("PASS", "UNKNOWN") for _, s, _ in RESULTS) else 1
+    return 0 if all(s in ("PASS", "UNKNOWN", "NOT-OBS") for _, s, _ in RESULTS) else 1
 
 
 if __name__ == "__main__":

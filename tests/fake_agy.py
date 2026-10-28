@@ -33,6 +33,10 @@ if mode == "effort_err_stderr" and opt("--effort"):
 if mode == "model_err_stderr" and opt("--model"):
     sys.stderr.write(f"error: unknown model '{opt('--model')}'\n")
     sys.exit(2)
+REAL_BOTH = ('invalid model selection (--model "{m}" --effort "{e}"): invalid --effort "{e}" (valid: low, medium, high)')
+if mode == "real_effort_err_stderr":     # text shape observed on real agy 1.4.9: model echo + effort cause
+    sys.stderr.write("error: " + REAL_BOTH.format(m=opt("--model") or "", e=opt("--effort") or "") + "\n")
+    sys.exit(2)
 out({"event": "init", "conversation_id": conv})
 if mode == "denial_stderr":
     sys.stderr.write("tool run_command auto-denied in headless mode (soft denial)\n")
@@ -56,6 +60,14 @@ if mode == "no_response":      # SUCCESS without result.response -> parser must 
 if mode == "effort_err_result":
     out({"event": "result", "result": {"conversation_id": conv, "status": "ERROR",
                                        "error": "Model does not support effort 'high'"}})
+    sys.exit(0)
+if mode == "real_effort_err_result":
+    out({"event": "result", "result": {"conversation_id": conv, "status": "ERROR",
+                                       "error": REAL_BOTH.format(m=opt("--model") or "", e=opt("--effort") or "")}})
+    sys.exit(0)
+if mode == "real_model_err_result":
+    out({"event": "result", "result": {"conversation_id": conv, "status": "ERROR",
+                                       "error": f'invalid model selection (--model "{opt("--model")}" --effort ""): model is not recognized'}})
     sys.exit(0)
 if mode == "model_err_result":
     out({"event": "result", "result": {"conversation_id": conv, "status": "ERROR", "error": "Unknown model: nope"}})
