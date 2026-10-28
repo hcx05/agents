@@ -52,6 +52,10 @@ agent resume <Agent Session ID>   # 顯示先前聊天室內容，再用原本�
 - 舊版（v1）Session 可讀可恢復，但當時沒有保存的暫存訊息無法復原。
 - Claude 的 `-p` Session 預設只保留約 30 天（CLI 的 `cleanupPeriodDays`），過期後會出現 `session_lost`，本工具不會自動換新 Session。
 
+### 實驗：原生 Claude Session 匯入（尚未成為正式功能）
+
+底層已備妥 `--resume <id> --fork-session` 的安全規則（fork 後 Session ID 必須是新的、原 Session 不能被當成工作 Session、一般 resume 仍拒絕 ID 變更），但**沒有** `agent <Claude Session ID>` 這個指令。是否可行用拋棄式 Session 驗證：`python probe.py claude --tests fork`（約 3 次小額度呼叫，只用腳本自己建立的 Session）。`python probe.py agy --tests keys` 只印出 agy 事件的欄位名稱，用來確認它有沒有模型欄位。
+
 ### 每則回覆的模型
 
 每個 Agent 回覆前會在聊天室標一行 `Manager · claude · <模型>（CLI 回報）`，只在該 Agent 的模型變動時再出現。三種意義不同：**CLI 回報**（CLI 在這個 turn 的事件裡明說用了什麼）／**要求使用 X（CLI 未確認）**（我們傳了 `--model`，但 CLI 沒回報）／**模型未知**。要求的模型不會被當成實際模型；每個 turn 各自記錄（`events.jsonl` 的 `chat.turn`），之後改設定不會改寫歷史。agy 目前沒有已確認的模型欄位，所以通常顯示「要求使用」或「未知」。

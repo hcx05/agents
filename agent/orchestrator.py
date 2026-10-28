@@ -416,6 +416,9 @@ class Engine:
                 task = f", task={a.active_task}" if a.role == "worker" and a.active_task else ""
                 lt = a.last_turn
                 last = (f", last turn {lt['turn']}: model {model_label(lt)}" if lt else "")
+                cm = (self.store.state.get("agents", {}).get(a.id) or {}).get("cli_meta")
+                if isinstance(cm, dict) and cm:
+                    last += ", cli " + " ".join(f"{k}={v}" for k, v in cm.items() if k != "capabilities")
                 lines.append(f"  {a.id} ({a.role}, {a.cfg.cli}) {self._activity(a)}{task}, queued={len(a.inbox)}, "
                              f"model={a.cfg.model or 'default'}, effort={a.cfg.effort or 'default'}, "
                              f"session={a.session_id or '-'}{last}")

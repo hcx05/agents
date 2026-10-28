@@ -365,5 +365,31 @@ class TestSessionIdGuardsAndFork(unittest.TestCase):
         runner.check_shim_args(inv.args)                                       # no character cmd.exe would reinterpret
 
 
+class TestProbeHelpers(unittest.TestCase):
+    def test_transcript_lookup_and_fingerprint_are_read_only(self):
+        import probe
+        tmp = Path(tempfile.mkdtemp(prefix="agent cfgdir "))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        proj = tmp / "projects" / "-some-project"
+        proj.mkdir(parents=True)
+        f = proj / "abc.jsonl"
+        f.write_bytes(b'{"x":1}\n')
+        old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(tmp)
+        try:
+            self.assertEqual(probe.find_transcript("abc"), f)
+            self.assertIsNone(probe.find_transcript("missing"))
+            (tmp / "projects" / "-other").mkdir()
+            (tmp / "projects" / "-other" / "abc.jsonl").write_bytes(b"dup")      # duplicate copy -> ambiguous -> not used
+            self.assertIsNone(probe.find_transcript("abc"))
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = old
+        self.assertEqual(probe.file_fingerprint(f)[0], 8)
+        self.assertIsNone(probe.file_fingerprint(None))
+
+
 if __name__ == "__main__":
     unittest.main()

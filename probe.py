@@ -6,6 +6,10 @@
     python probe.py claude --tests version,schema,resume,badmodel,effort,perm,interrupt
     python probe.py agy --tests version,help,plain,resume,stdin,stdin-conv,stdin-schema,badmodel,effort,perm,interrupt
     python probe.py agy --command "C:\\path\\to\\agy.exe"
+    python probe.py claude --tests fork    # EXPERIMENT (opt-in, ~3 small model calls): can a native session be forked
+                                           # and then obey the Manager JSON protocol? uses a throwaway session only
+    python probe.py agy --tests keys       # EXPERIMENT (opt-in, 1 small call): which keys do agy's events carry
+                                           # (is there a model field?) - prints key NAMES only
 
 Nothing dangerous is run: the only "write" test asks for a file in the temp folder and EXPECTS a
 headless permission denial (it never changes any permission setting).
@@ -13,6 +17,7 @@ headless permission denial (it never changes any permission setting).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -115,6 +120,109 @@ def probe_claude(prefix, cwd, tests):
         record_permission("claude", r.denials, created)
     if "interrupt" in tests:
         probe_interrupt(ad, cwd)
+    if "fork" in tests:
+        probe_fork(ad, prefix, cwd)
+
+
+def claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+
+
+def find_transcript(sid: str):
+    """Where Claude Code keeps a session's transcript (~/.claude/projects/<project>/<id>.jsonl). Read-only lookup; the
+    format is internal, so only size + hash of the whole file are used."""
+    hits = list((claude_config_dir() / "projects").glob(f"*/{sid}.jsonl"))
+    return hits[0] if len(hits) == 1 else None
+
+
+def file_fingerprint(path):
+    if path is None or not path.is_file():
+        return None
+    data = path.read_bytes()
+    return (len(data), hashlib.sha256(data).hexdigest())
+
+
+def probe_fork(ad, prefix, cwd):
+    """Can a NATIVE (free-form) Claude session be forked and then act as the Manager (JSON protocol, dispatch)?
+    Only a throwaway session created right here is ever used; nothing of yours is touched. Steps:
+      1 create a plain conversation (no schema, no preamble)      2 fork it with the Manager preamble + schema
+      3 check: new id, original transcript byte-identical, JSON valid, context kept, dispatch to a worker works."""
+    print("\n-- fork experiment (throwaway session in a temp folder) --")
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        print("   WARNING: CLAUDE_CODE_SESSION_ID is set (this shell runs inside a Claude Code session). The CLI may then "
+              "use THAT id for new/forked sessions, which makes the 'new id' check less meaningful. Run this from a plain "
+              "PowerShell window.")
+    print(f"   launcher kind: {prefix[0]!r}  cmd-shim: {runner.is_cmd_shim(prefix)}")
+    saved_a = []
+    ra = ad.run(TurnRequest("probe", "Remember this code word: PINEAPPLE-42. Reply with one short sentence.", cwd, None,
+                            timeout=240), threading.Event(), saved_a.append)
+    record("fork: native-style session created", "PASS" if ra.ok and ra.session_id else "FAIL", ra.error or ra.session_id or "")
+    if not (ra.ok and ra.session_id):
+        return
+    a_id = ra.session_id
+    t_before = find_transcript(a_id)
+    fp_before = file_fingerprint(t_before)
+    record("fork: original transcript located (for the unchanged check)", "PASS" if fp_before else "UNKNOWN",
+           str(t_before) if t_before else "not found under CLAUDE_CONFIG_DIR/projects; unchanged-check will be skipped")
+    pre = protocol.manager_preamble("manager", [("w1", "agy")])
+    saved_b = []
+    rb = ad.run(TurnRequest("probe", pre + "\n\n---\n[from user]\nWhat code word did I give you earlier? Report it to me "
+                            "with a final action.\n\n[system] team status -> w1: free; manager turns used 1/30", cwd, a_id,
+                            schema=protocol.MANAGER_SCHEMA, fork=True, timeout=300), threading.Event(), saved_b.append)
+    record("fork: fork turn succeeded", "PASS" if rb.ok else "FAIL", f"{rb.error_kind}: {rb.error}" if not rb.ok else rb.mode)
+    b_id = saved_b[0] if saved_b else None
+    record("fork: new session id, original id not reported as the working session",
+           "PASS" if (b_id and b_id != a_id and rb.session_id == b_id) else "FAIL", f"original={a_id} fork={b_id}")
+    fp_after = file_fingerprint(t_before)
+    if fp_before:
+        record("fork: original transcript unchanged", "PASS" if fp_after == fp_before else "FAIL",
+               f"before={fp_before[0]}B after={fp_after[0] if fp_after else None}B")
+    if rb.ok:
+        obj, perr = protocol.extract_json(rb.text)
+        errs = protocol.validate_manager_message(obj, protocol.TeamView("manager", ["w1"], {})) if obj else [perr or "no JSON"]
+        record("fork: Manager JSON protocol obeyed after fork", "PASS" if not errs else "FAIL", "; ".join(errs)[:160])
+        fin = next((x for x in (obj or {}).get("actions", []) if x.get("type") == "final"), None)
+        record("fork: earlier conversation context retained", "PASS" if fin and "PINEAPPLE" in fin.get("text", "").upper() else "FAIL",
+               (fin or {}).get("text", rb.text)[:80])
+    if b_id:
+        saved_c = []
+        rc = ad.run(TurnRequest("probe", "[from user]\nDelegate to worker w1 the task with task_id t1 and text 'say hi'. "
+                                "Use a dispatch action only.\n\n[system] team status -> w1: free; manager turns used 1/30",
+                                cwd, b_id, schema=protocol.MANAGER_SCHEMA, timeout=300), threading.Event(), saved_c.append)
+        obj, perr = protocol.extract_json(rc.text) if rc.ok else (None, rc.error)
+        errs = protocol.validate_manager_message(obj, protocol.TeamView("manager", ["w1"], {})) if obj else [perr or "no JSON"]
+        has_dispatch = bool(obj) and any(x.get("type") == "dispatch" and x.get("to") == "w1" for x in obj.get("actions", []))
+        record("fork: forked Manager can dispatch to the configured worker", "PASS" if (not errs and has_dispatch) else "FAIL",
+               "; ".join(errs)[:120] or ("dispatch ok" if has_dispatch else "no dispatch action"))
+        record("fork: later resume of the fork keeps its id", "PASS" if (rc.ok and saved_c == [] and rc.session_id == b_id) else "FAIL",
+               f"{rc.error_kind}: {rc.error}" if not rc.ok else f"saved={saved_c}")
+    print("   (the throwaway sessions stay in Claude's own storage; they hold no data of yours)")
+
+
+def probe_agy_keys(prefix, cwd):
+    p, o, e = raw_run(prefix, ["-p", "Reply with exactly: PONG", "--output-format", "stream-json"], None, cwd, 240)
+    names, model_values = [], []
+    for l in o:
+        try:
+            x = json.loads(l)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(x, dict):
+            continue
+        row = {"event": x.get("event") or x.get("type"), "keys": sorted(x)}
+        for k in ("step_update", "result", "data"):
+            if isinstance(x.get(k), dict):
+                row[k + ".keys"] = sorted(x[k])
+        names.append(row)
+        for scope in (x, x.get("step_update"), x.get("result")):
+            if isinstance(scope, dict) and isinstance(scope.get("model"), str):
+                model_values.append(scope["model"])
+    for row in names[:12]:
+        print("   ", json.dumps(row, ensure_ascii=False)[:230])
+    record("agy event keys captured (names only)", "PASS" if names else "FAIL", f"{len(names)} event(s), exit={p.exit_code}")
+    record("agy reports a model in its events", "PASS" if model_values else "NOT-OBS",
+           f"model value(s): {sorted(set(model_values))}" if model_values else
+           "no `model` key found in init/step_update/result: model for agy stays unknown/requested")
 
 
 # ------------------------------------------------------------------ agy
@@ -178,6 +286,8 @@ def probe_agy(prefix, cwd, tests):
         record_permission("agy", r.denials, created)
     if "interrupt" in tests:
         probe_interrupt(ad, cwd)
+    if "keys" in tests:
+        probe_agy_keys(prefix, cwd)
 
 
 def probe_interrupt(ad, cwd):
