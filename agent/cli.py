@@ -1,4 +1,4 @@
-"""Command line entry: `agent`, `agent config`, in-chat /status /interrupt /exit."""
+"""Command line entry: `agent`, `agent pick`, `agent config`, in-chat /status /interrupt /exit."""
 from __future__ import annotations
 
 import argparse
@@ -83,6 +83,29 @@ def _tui_decision(args: argparse.Namespace) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def _picker_decision(args: argparse.Namespace) -> Tuple[bool, Optional[str]]:
+    """Full-screen Session Picker requires an interactive terminal and prompt_toolkit.
+    When unavailable, returns (False, hint) so `agent pick` can safely display a text list without starting a session."""
+    if getattr(args, "plain", False) or os.environ.get("AGENT_PLAIN") or os.environ.get("TERM", "").lower() == "dumb":
+        return False, ("Session Picker 需要互動式全螢幕終端機（目前為 --plain、AGENT_PLAIN 或 TERM=dumb）。"
+                       "以下列出已儲存的對話；請用 `agent resume <Session ID>` 恢復對話，或執行 `agent` 建立新對話。")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False, ("Session Picker 需要互動式終端機（stdin/stdout 必須是 TTY）。"
+                       "以下列出已儲存的對話；請用 `agent resume <Session ID>` 恢復對話，或執行 `agent` 建立新對話。")
+    try:
+        importlib.import_module("prompt_toolkit")
+        importlib.import_module(f"{__package__}.picker")
+    except ModuleNotFoundError as e:
+        if (e.name or "").split(".")[0] in ("prompt_toolkit", "wcwidth"):
+            return False, ("全螢幕 Session Picker 需要 prompt_toolkit，目前沒有安裝。"
+                           "要啟用全螢幕請執行：pip install \"prompt_toolkit>=3.0.36\"；"
+                           "以下列出已儲存的對話，可用 `agent resume <Session ID>` 恢復對話。")
+        return False, _tui_broken(e)
+    except Exception as e:
+        return False, _tui_broken(e)
+    return True, None
+
+
 def _run_slash(engine: Engine, ui: UI, cmd: str) -> bool:
     """Returns True when the chat should exit."""
     name = cmd.split()[0].lower()
@@ -142,6 +165,36 @@ def cmd_resume(args: argparse.Namespace) -> int:
               "  To continue an Agent session: agent resume <id>   (ids are listed by `agent sessions`)", file=sys.stderr)
         return 2
     return _run_chat(args, args.session_id)
+
+
+def cmd_pick(args: argparse.Namespace) -> int:
+    """Open the full-screen Telescope-style Session Picker, then safely hand off to resume or new chat."""
+    sessions_root = home_dir() / "sessions"
+    use_picker, hint = _picker_decision(args)
+    if not use_picker:
+        if hint:
+            print(hint, file=sys.stderr)
+        print(format_sessions(Store.summaries(sessions_root), getattr(args, "limit", 20)))
+        return 0
+    try:
+        from .picker import run_picker
+        choice = run_picker(sessions_root=sessions_root, current_cwd=os.getcwd())
+    except Exception as e:
+        print(f"全螢幕 Session Picker 無法在這個終端啟動（{type(e).__name__}: {e}）。"
+              "以下列出已儲存的對話；請用 `agent resume <Session ID>` 恢復對話：", file=sys.stderr)
+        print(format_sessions(Store.summaries(sessions_root), getattr(args, "limit", 20)))
+        return 0
+
+    if choice.action == "cancel":
+        return 0
+    if choice.action == "new":
+        return _run_chat(args, None)
+    if choice.action == "resume" and choice.session_id:
+        # Never auto-enable --here when resuming from the picker; enforce all standard resume validations
+        args.session_id = choice.session_id
+        args.here = False
+        return cmd_resume(args)
+    return 0
 
 
 def cmd_import(args: argparse.Namespace) -> int:
@@ -229,7 +282,7 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
             print(f"Cannot resume {resume_id}: {e}", file=sys.stderr)
             return 2
         try:
-            store = Store.open_existing(root, resume_id)
+            store = Store.open_existing(root, resume_id, repair=False)
         except StoreError as e:
             lock.release()
             print(f"Cannot resume {resume_id}: {e}", file=sys.stderr)
@@ -239,6 +292,7 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
             lock.release()
             print(f"Cannot resume {resume_id}:\n" + "\n".join("  - " + e for e in errors), file=sys.stderr)
             return 2
+        store._repair_events_tail()
     else:
         store = Store(root)
         lock = SessionLock(store.dir)
@@ -349,12 +403,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="agent",
         description="Hierarchical AI agent team (Manager + Worker) in a terminal chat room. "
-                    "Run `agent` to start; `agent config` shows/creates the config file.")
+                    "Run `agent` to start; `agent pick` opens the session picker; `agent config` shows/creates the config file.")
     p.add_argument("--version", action="version", version=f"agent {__version__}")
     p.add_argument("--config", help="use this config file instead of %%APPDATA%%\\agent\\config.json")
     p.add_argument("--plain", action="store_true", default=False,
                    help="line-based chat instead of the full-screen chat room (also used when not on a terminal)")
     sub = p.add_subparsers(dest="command")
+    pk = sub.add_parser("pick", help="browse, search, preview and resume a saved Agent session (or press Ctrl+N for a new one)")
+    pk.add_argument("--replay", type=int, default=60, help="show the last N earlier chat items first when resuming (0 = none)")
+    pk.add_argument("--limit", type=int, default=20, help="show at most this many in plain/non-TTY fallback")
+    pk.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    pk.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     r = sub.add_parser("sessions", help="list saved Agent sessions")
     r.add_argument("--limit", type=int, default=20, help="show at most this many (newest)")
     r.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -378,7 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-COMMANDS = ("sessions", "resume", "import", "config")
+COMMANDS = ("pick", "sessions", "resume", "import", "config")
 
 
 def rewrite_argv(argv: List[str]) -> Optional[List[str]]:
@@ -411,6 +470,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if argv is None:
         return 2
     args = build_parser().parse_args(argv)
+    if args.command == "pick":
+        return cmd_pick(args)
     if args.command == "import":
         return cmd_import(args)
     if args.command == "config":

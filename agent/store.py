@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 STATE_VERSION = 3
 RAW_LINE_MAX = 2000
 RAW_FILE_MAX = 2 * 1024 * 1024
+MAX_FIRST_SCAN_EVENTS = 200
 
 _PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
@@ -82,6 +83,12 @@ def safe_session_dir(sessions_root: Path, session_id: str) -> Path:
     return target
 
 
+def _valid_ts(val: Any) -> Optional[float]:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    return float(val)
+
+
 class Store:
     def __init__(self, sessions_root: Path, session_id: Optional[str] = None, state: Optional[Dict[str, Any]] = None):
         self.id = session_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
@@ -100,7 +107,7 @@ class Store:
         }
 
     @classmethod
-    def open_existing(cls, sessions_root: Path, session_id: str) -> "Store":
+    def open_existing(cls, sessions_root: Path, session_id: str, repair: bool = True) -> "Store":
         """Open a saved session for resuming. Old (version 1) states are upgraded in memory; nothing is written
         until the engine saves. A damaged state.json or a half-written last event line never raises past StoreError."""
         d = safe_session_dir(Path(sessions_root), session_id)
@@ -113,7 +120,7 @@ class Store:
         except (OSError, ValueError) as e:
             raise StoreError(f"state.json of session {session_id!r} is unreadable ({e}); it was not modified")
         ver = st.get("version", 1)
-        if not isinstance(ver, int) or ver > STATE_VERSION:
+        if isinstance(ver, bool) or not isinstance(ver, int) or ver < 1 or ver > STATE_VERSION:
             raise StoreError(f"session {session_id!r} was written by a newer version of agent (state version {ver!r})")
         for key, default in (("agents", {}), ("tasks", {}), ("mail", {}), ("config", None)):
             if not isinstance(st.get(key), type(default)) and not (default is None and st.get(key) is None):
@@ -121,7 +128,8 @@ class Store:
         store = cls(Path(sessions_root), session_id, state=st)
         store.loaded_version = ver
         store.state["version"] = STATE_VERSION
-        store._repair_events_tail()
+        if repair:
+            store._repair_events_tail()
         store._seq = max([e.get("seq", 0) for e in cls.read_events(d) if isinstance(e.get("seq"), int)] or [0])
         for p in (d / "raw").glob("*.jsonl"):
             try:
@@ -204,20 +212,28 @@ class Store:
         out: List[Dict[str, Any]] = []
         for sid in Store.list_sessions(sessions_root):
             d = Path(sessions_root) / sid
-            row: Dict[str, Any] = {"id": sid, "ok": True, "version": None, "updated": None, "cwd": None, "state": None,
-                                   "agents": "", "locked": False, "first": "", "import_source": None}
+            row: Dict[str, Any] = {"id": sid, "ok": True, "version": None, "created": None, "updated": None,
+                                   "cwd": None, "state": None, "agents": "", "locked": False, "first": "",
+                                   "import_source": None}
             try:
                 st = json.loads((d / "state.json").read_text(encoding="utf-8"))
-                row.update(version=st.get("version", 1), updated=st.get("updated") or st.get("created"),
-                           cwd=st.get("cwd"), state=st.get("state"),
+                if not isinstance(st, dict):
+                    raise ValueError("state.json is not an object")
+                created = _valid_ts(st.get("created"))
+                updated = _valid_ts(st.get("updated")) or created
+                row.update(version=st.get("version", 1), created=created, updated=updated,
+                           cwd=st.get("cwd") if isinstance(st.get("cwd"), str) else None,
+                           state=st.get("state") if isinstance(st.get("state"), str) else None,
                            agents="+".join(str(a.get("cli", "?")) for a in (st.get("agents") or {}).values()))
                 imp = st.get("import")
                 if isinstance(imp, dict) and isinstance(imp.get("source_id"), str):
                     row["import_source"] = imp["source_id"]
-            except (OSError, ValueError, AttributeError):
+            except (OSError, ValueError, AttributeError, TypeError):
                 row["ok"] = False
             row["locked"] = SessionLock.is_locked(d)
-            for rec in Store.iter_events(d):
+            for idx, rec in enumerate(Store.iter_events(d)):
+                if idx >= MAX_FIRST_SCAN_EVENTS:
+                    break
                 if rec.get("type") == "chat" and rec.get("sender") == "Me":
                     row["first"] = str(rec.get("text", "")).replace("\n", " ")[:50]
                     break
