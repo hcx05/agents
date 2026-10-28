@@ -113,6 +113,13 @@ def main():
         end = time.time() + 60
         while not os.path.exists(step["wait_for_file"]) and time.time() < end:
             time.sleep(0.02)
+    for k in step.get("emit_after_wait", []):          # more CLI output after the first gate (activity-time tests)
+        sys.stdout.write(k + "\n")
+        sys.stdout.flush()
+    if step.get("wait_for_file2"):
+        end = time.time() + 60
+        while not os.path.exists(step["wait_for_file2"]) and time.time() < end:
+            time.sleep(0.02)
     if step.get("sleep"):
         end = time.time() + float(step["sleep"])
         while time.time() < end:

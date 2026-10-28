@@ -59,7 +59,12 @@ class Running:
     thread: threading.Thread
     cancel: threading.Event
     epoch: int
-    started: float = field(default_factory=time.time)
+    started: float = field(default_factory=time.time)    # wall clock, display only
+    t0: float = 0.0              # engine clock (monotonic) at turn start
+    last_output: float = 0.0     # engine clock of the newest raw CLI line; written by the CLI reader threads
+    lines: int = 0               # raw lines seen (display / tests)
+    warn_basis: float = -1.0     # last_output value the silence timer was armed for
+    next_warn: float = 0.0       # engine clock at which the next "no new output" notice is due
 
 
 @dataclass
@@ -88,10 +93,27 @@ class TurnDone:
     diff: Optional[FileDiff]
 
 
+def fmt_elapsed(sec: float) -> str:
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{sec % 3600 // 60:02d}m{sec % 60:02d}s"
+
+
+def fmt_quiet(sec: float) -> str:
+    sec = max(0, int(sec))
+    return f"{sec} 秒" if sec < 120 else f"{sec // 60} 分 {sec % 60:02d} 秒"
+
+
 class Engine:
     def __init__(self, cfg: Config, store: Store, ui: UI, cwd: str,
-                 adapter_factory: Callable[[AgentCfg], Adapter] = get_adapter):
+                 adapter_factory: Callable[[AgentCfg], Adapter] = get_adapter,
+                 clock: Callable[[], float] = time.monotonic, watch_tick: float = 1.0):
         self.cfg, self.store, self.ui, self.cwd = cfg, store, ui, cwd
+        self.clock = clock                 # elapsed-time source; tests inject a fake one
+        self._tick = watch_tick            # how often the idle loop re-checks for silent turns
         self.agents: Dict[str, AgentRT] = {
             aid: AgentRT(aid, ac, adapter_factory(ac)) for aid, ac in cfg.agents.items()}
         self.mgr = self.agents[cfg.manager]
@@ -146,14 +168,22 @@ class Engine:
             time.sleep(0.03)
         return False
 
+    def _activity(self, a: AgentRT) -> str:
+        r = a.running
+        if not r:
+            return "idle"
+        now = self.clock()
+        return (f"running {fmt_elapsed(now - r.t0)} (since {time.strftime('%H:%M:%S', time.localtime(r.started))}), "
+                f"last output {fmt_elapsed(now - r.last_output)} ago" + ("" if r.lines else " (none yet)"))
+
     def status_text(self) -> str:
         with self._lock:
             lines = [f"state: {self.state.value}   session: {self.store.id}",
                      f"folder: {self.cwd}",
                      f"manager turns this input: {self.manager_turns}/{self.cfg.max_manager_turns_per_input}"]
             for a in self.agents.values():
-                busy = "running" if a.running else "idle"
-                lines.append(f"  {a.id} ({a.role}, {a.cfg.cli}) {busy}, queued={len(a.inbox)}, "
+                task = f", task={a.active_task}" if a.role == "worker" and a.active_task else ""
+                lines.append(f"  {a.id} ({a.role}, {a.cfg.cli}) {self._activity(a)}{task}, queued={len(a.inbox)}, "
                              f"model={a.cfg.model or 'default'}, effort={a.cfg.effort or 'default'}, "
                              f"session={a.session_id or '-'}")
             open_t = [f"{tid}:{t['status']}@{t['worker']}" for tid, t in self.tasks.items()
@@ -161,12 +191,46 @@ class Engine:
             lines.append("  open tasks: " + (", ".join(open_t) or "none"))
             if self.awaiting_user:
                 lines.append("  waiting for your answer to: " + self.awaiting_user["text"][:80])
+            elif not self.mgr.running and open_t:
+                waiting = ", ".join(w for w in self.worker_ids if self.agents[w].running or self.agents[w].inbox)
+                lines.append("  Manager is waiting for: " + (waiting or "a worker report"))
             return "\n".join(lines)
+
+    def check_silence(self) -> None:
+        """Print at most one 'no new output' notice per agent per interval. It only informs: nothing is interrupted
+        and the turn timeout is untouched. Safe to call from any thread; the loop calls it on every idle tick."""
+        try:
+            with self._lock:
+                now = self.clock()
+                for a in self.agents.values():
+                    r = a.running
+                    if not r:
+                        continue
+                    if r.warn_basis != r.last_output:        # new output since last look -> restart the quiet timer
+                        r.warn_basis = r.last_output
+                        r.next_warn = r.last_output + self.cfg.silence_warn_sec
+                    if now >= r.next_warn:
+                        quiet = now - r.last_output
+                        r.next_warn = now + self.cfg.silence_repeat_sec
+                        self.store.log("silence", agent=a.id, quiet_sec=round(quiet, 1))
+                        self.ui.system(f"⚠ {self._label(a, short=True)} 已經 {fmt_quiet(quiet)}沒有新輸出。\n"
+                                       "執行流程尚未結束，可使用 /status 或 /interrupt。")
+        except Exception:
+            self.store.log("internal_error", trace=traceback.format_exc())
+
+    @staticmethod
+    def _label(a: AgentRT, short: bool = False) -> str:
+        name = "Manager" if a.role == "manager" else a.id
+        return name if short else f"{name} ({a.cfg.cli})"
 
     # ------------------------------------------------------------ loop
     def _loop(self) -> None:
         while True:
-            evt = self._events.get()
+            try:
+                evt = self._events.get(timeout=self._tick)
+            except queue.Empty:
+                self.check_silence()
+                continue
             try:
                 with self._lock:
                     kind = evt[0]
@@ -378,16 +442,40 @@ class Engine:
         epoch = self.epoch
         th = threading.Thread(target=self._turn_thread, args=(a, req, cancel, epoch), daemon=True,
                               name=f"turn-{a.id}")
-        a.running = Running(th, cancel, epoch)
+        kinds = {m["kind"] for m in mails}
+        t0 = self.clock()
+        a.running = Running(th, cancel, epoch, t0=t0, last_output=t0)
         a.turns += 1
         self.store.log("turn_start", agent=a.id, epoch=epoch, session=sid, model=model, effort=effort,
                        prompt_chars=len(prompt), resumed=sid is not None)
-        if a.role == "worker":
-            self.ui.system(f"{a.id} is working on task {a.active_task}...")
+        self._announce_start(a, kinds)
         th.start()
+
+    def _announce_start(self, a: AgentRT, kinds: Set[str]) -> None:
+        """One short timeline line when a turn starts; a pure format-repair retry stays quiet (the rejection already said so)."""
+        if a.role == "worker":
+            if "answer" in kinds and "task" not in kinds:
+                self.ui.system(f"{self._label(a)} 收到 Manager 的回答，繼續執行。")
+            else:
+                self.ui.system(f"{self._label(a)} 開始執行（任務 {a.active_task}）。")
+        elif kinds <= {"system"} and a.repair_used:
+            return
+        elif "worker" in kinds:
+            self.ui.system("Manager 正在整理結果。")
+        elif "user_answer" in kinds:
+            self.ui.system("Manager 收到你的回答，繼續執行。")
+        else:
+            self.ui.system(f"{self._label(a)} 開始執行。")
 
     def _turn_thread(self, a: AgentRT, req: TurnRequest, cancel: threading.Event, epoch: int) -> None:
         diff: Optional[FileDiff] = None
+        run = a.running
+
+        def on_raw(stream: str, line: str) -> None:
+            if run is not None:                    # plain attribute writes: no event is queued per CLI line
+                run.last_output = self.clock()
+                run.lines += 1
+            self.store.raw(a.id, stream, line)
         try:
             snap_cfg = self.cfg.snapshot
             use_snap = snap_cfg.get("enabled", True)
@@ -396,7 +484,7 @@ class Engine:
                 kw = dict(max_files=snap_cfg.get("max_files", 20000), max_seconds=snap_cfg.get("max_seconds", 5.0))
                 before = take_snapshot(self.cwd, **kw)
             res = a.adapter.run(req, cancel, lambda sid: self._on_session(a.id, sid),
-                                lambda s, l: self.store.raw(a.id, s, l))
+                                on_raw)
             if use_snap and before is not None:
                 diff = diff_snapshots(before, take_snapshot(self.cwd, **kw))
         except Exception as e:  # adapter bug must not hang the engine

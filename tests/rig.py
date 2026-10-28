@@ -49,10 +49,24 @@ def W(status: str, tid: str, text: str, files: Optional[List[str]] = None, **ext
     return d
 
 
+class FakeClock:
+    """Manually advanced monotonic clock so elapsed-time / silence logic is tested without sleeping."""
+
+    def __init__(self, start: float = 1000.0):
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, sec: float) -> None:
+        self.t += sec
+
+
 class Rig:
     def __init__(self, scenario: Dict[str, list], timeout: float = 30, max_turns: int = 30,
                  worker_command: Optional[str] = None, manager_command: Optional[str] = None,
-                 worker_model: Optional[str] = None):
+                 worker_model: Optional[str] = None, clock=None, cfg_extra: Optional[Dict[str, Any]] = None,
+                 watch_tick: Optional[float] = None):
         self.tmp = Path(tempfile.mkdtemp(prefix="agent test 測試 "))   # spaces + CJK on purpose
         self.cwd = self.tmp / "work dir 工作"
         self.cwd.mkdir()
@@ -68,10 +82,16 @@ class Rig:
         if worker_command:
             wrk["command"] = worker_command
         self.cfg = parse_config({"manager": "manager", "agents": {"manager": mgr, "w1": wrk},
-                                 "turn_timeout_sec": timeout, "max_manager_turns_per_input": max_turns})
+                                 "turn_timeout_sec": timeout, "max_manager_turns_per_input": max_turns,
+                                 **(cfg_extra or {})})
         self.store = Store(self.tmp / "sessions")
         self.ui = BufferUI()
-        self.engine = Engine(self.cfg, self.store, self.ui, str(self.cwd))
+        self.clock = clock
+        # fake-clock rigs also stop the idle tick: tests drive check_silence() themselves
+        kw: Dict[str, Any] = dict(clock=clock, watch_tick=3600.0) if clock else {}
+        if watch_tick:
+            kw["watch_tick"] = watch_tick
+        self.engine = Engine(self.cfg, self.store, self.ui, str(self.cwd), **kw)
         self.engine.start()
 
     def say(self, text: str, wait: float = 60) -> None:

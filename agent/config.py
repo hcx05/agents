@@ -18,6 +18,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "turn_timeout_sec": 1800,
     "max_manager_turns_per_input": 30,
+    "silence_warn_sec": 60,
+    "silence_repeat_sec": 300,
 }
 
 AGENT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
@@ -46,6 +48,8 @@ class Config:
     turn_timeout_sec: float = 1800
     max_manager_turns_per_input: int = 30
     snapshot: Dict[str, Any] = field(default_factory=dict)
+    silence_warn_sec: float = 60       # first "no new output" notice after this long
+    silence_repeat_sec: float = 300    # then at most one more notice per this long (reset by any new output)
 
     @property
     def workers(self) -> List[AgentCfg]:
@@ -132,8 +136,14 @@ def parse_config(raw: Any) -> Config:
     snap = raw.get("snapshot", {})
     if not isinstance(snap, dict):
         raise ConfigError("snapshot must be an object")
+    quiet = {}
+    for key, default in (("silence_warn_sec", 60), ("silence_repeat_sec", 300)):
+        v = raw.get(key, default)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            raise ConfigError(f"{key} must be a positive number")
+        quiet[key] = v
     return Config(manager=manager, agents=agents, turn_timeout_sec=timeout,
-                  max_manager_turns_per_input=turns, snapshot=snap)
+                  max_manager_turns_per_input=turns, snapshot=snap, **quiet)
 
 
 def load_config(path: Optional[Path] = None, create: bool = True) -> Config:
