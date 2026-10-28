@@ -203,8 +203,6 @@ class TestAdaptersBuild(unittest.TestCase):
         self.assertEqual(big.args[big.args.index("--conversation") + 1], "c1")
         forced = AgyAdapter(AgentCfg("a", "worker", "agy", options={"stdin_mode": "always"})).build(self.req(), ["agy"])
         self.assertNotIn("-p", forced.args)
-        with self.assertRaises(ValueError):                       # effort unverified -> explicit error
-            ad.build(self.req(effort="high"), ["agy"])
 
     def test_claude_parser_on_real_event_shapes(self):
         ad = ClaudeAdapter(AgentCfg("a", "manager", "claude"))
@@ -254,6 +252,274 @@ class TestAdaptersBuild(unittest.TestCase):
         self.assertEqual(seen, ["C9"])
         self.assertEqual(res.text, '{"x":1}')
         self.assertTrue(res.denials)
+
+
+OFFICIAL_OK = [
+    '{"event":"init","conversation_id":"conv-1"}',
+    '{"event":"step_update","step_type":"agent_response","text_delta":"{\\"status\\":"}',
+    '{"event":"step_update","step_type":"tool_call","text_delta":"IGNORE ME","tool_info":{"name":"ls"}}',
+    '{"event":"step_update","step_type":"agent_response","text_delta":" \\"done\\"}"}',
+    '{"event":"result","result":{"conversation_id":"conv-1","status":"SUCCESS","response":"{\\"status\\": \\"done\\"}"}}',
+]
+
+
+def agy_parse(lines, stderr=(), exit_code=0, session_id=None, status="ok"):
+    seen = []
+    ad = AgyAdapter(AgentCfg("a", "worker", "agy"))
+    p = ad.make_parser(TurnRequest("a", "x", ".", session_id), seen.append)
+    for l in lines:
+        p.feed("stdout", l)
+    for l in stderr:
+        p.feed("stderr", l)
+    res = AgyAdapter._classify_process(runner.ProcResult(status, exit_code), p)
+    return res, seen
+
+
+class TestAgyOfficialParser(unittest.TestCase):
+    def test_official_init_step_result_success(self):
+        res, seen = agy_parse(OFFICIAL_OK)
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(res.text, '{"status": "done"}')          # result.response, not an envelope
+        self.assertEqual(protocol.extract_json(res.text)[0], {"status": "done"})
+        self.assertEqual(res.session_id, "conv-1")
+        self.assertEqual(seen, ["conv-1"])                         # saved exactly once
+
+    def test_terminal_response_is_not_duplicated_with_deltas(self):
+        res, _ = agy_parse(OFFICIAL_OK)
+        self.assertEqual(res.text.count("done"), 1)
+
+    def test_text_deltas_concatenate_without_inserted_newlines(self):
+        lines = ['{"event":"init","conversation_id":"c"}'] + [
+            json.dumps({"event": "step_update", "step_type": "agent_response", "text_delta": d})
+            for d in ['{"a":', ' "he', 'llo wor', 'ld"}']] + [
+            '{"event":"result","result":{"conversation_id":"c","status":"SUCCESS"}}']
+        res, _ = agy_parse(lines)                                  # no response -> deltas are the fallback
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(res.text, '{"a": "hello world"}')
+        self.assertNotIn("\n", res.text)
+
+    def test_non_agent_response_steps_are_ignored(self):
+        lines = ['{"event":"init","conversation_id":"c"}',
+                 '{"event":"step_update","step_type":"tool_output","text_delta":"SECRET TOOL OUTPUT"}',
+                 '{"event":"step_update","step_type":"usage","text_delta":"tokens=5"}',
+                 '{"event":"result","result":{"conversation_id":"c","status":"SUCCESS"}}']
+        res, _ = agy_parse(lines)
+        self.assertFalse(res.ok)                                   # nothing from the assistant -> not success
+        self.assertEqual(res.error_kind, "no_output")
+
+    def test_structured_output_preferred(self):
+        lines = ['{"event":"init","conversation_id":"c"}',
+                 '{"event":"result","result":{"conversation_id":"c","status":"SUCCESS","response":"prose","structured_output":{"say":"hi","n":1}}}']
+        res, _ = agy_parse(lines)
+        self.assertEqual(json.loads(res.text), {"say": "hi", "n": 1})
+        lines[1] = lines[1].replace('{"say":"hi","n":1}', '"{\\"say\\": \\"str\\"}"')   # JSON string form
+        res, _ = agy_parse(lines)
+        self.assertEqual(json.loads(res.text), {"say": "str"})
+        lines[1] = lines[1].replace('"structured_output":"{\\"say\\": \\"str\\"}"', '"structured_output":"not json"')
+        res, _ = agy_parse(lines)
+        self.assertEqual(res.text, "prose")                        # invalid structured_output -> response
+
+    def test_error_status_with_exit_code_zero_is_failure_even_with_text(self):
+        for status in ("ERROR", "CANCELED", "INTERRUPTED", "INVALID", "error", None):
+            r = {"conversation_id": "c", "response": '{"status":"done"}', "error": "backend failed"}
+            if status:
+                r["status"] = status
+            res, _ = agy_parse(['{"event":"init","conversation_id":"c"}',
+                                json.dumps({"event": "result", "result": r})], exit_code=0)
+            self.assertFalse(res.ok, status)
+            self.assertIn("backend failed", res.error)
+            self.assertEqual(res.text, "")
+
+    def test_error_without_response(self):
+        res, _ = agy_parse(['{"event":"init","conversation_id":"c"}',
+                            '{"event":"result","result":{"conversation_id":"c","status":"ERROR","error":{"message":"quota exhausted"}}}'])
+        self.assertFalse(res.ok)
+        self.assertIn("quota exhausted", res.error)
+
+    def test_missing_terminal_event_is_never_success(self):
+        res, _ = agy_parse(OFFICIAL_OK[:-1], exit_code=0)          # partial stream, process exited 0
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error_kind, "no_output")
+        self.assertIn("terminal result", res.error)
+
+    def test_success_with_nonzero_exit_is_failure(self):
+        res, _ = agy_parse(OFFICIAL_OK, exit_code=3)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error_kind, "exit")
+
+    def test_session_id_sources_and_no_overwrite(self):
+        res, seen = agy_parse(['{"event":"step_update","step_type":"agent_response","text_delta":"x","conversation_id":"from-step"}',
+                               '{"event":"result","result":{"conversation_id":"from-result","status":"SUCCESS","response":"x"}}'])
+        self.assertEqual(res.session_id, "from-step")              # first id wins, later metadata can't overwrite
+        self.assertEqual(seen, ["from-step"])
+        res, seen = agy_parse(['{"event":"result","result":{"conversation_id":"only-result","status":"SUCCESS","response":"x"}}'])
+        self.assertEqual(seen, ["only-result"])
+
+    def test_timeout_and_cancel_propagate(self):
+        for st, kind in (("timeout", "timeout"), ("cancelled", "cancelled")):
+            res, _ = agy_parse(OFFICIAL_OK[:2], exit_code=None, status=st)
+            self.assertFalse(res.ok)
+            self.assertEqual(res.error_kind, kind)
+            self.assertTrue(res.error)
+
+
+class TestAgySessionGuard(unittest.TestCase):
+    def test_matching_conversation_is_fine_and_not_resaved(self):
+        res, seen = agy_parse(OFFICIAL_OK, session_id="conv-1")
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(seen, [])
+        self.assertEqual(res.session_id, "conv-1")
+
+    def test_different_conversation_is_session_lost_and_never_saved(self):
+        res, seen = agy_parse([l.replace("conv-1", "conv-OTHER") for l in OFFICIAL_OK], session_id="conv-1")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error_kind, "session_lost")
+        self.assertEqual(seen, [])                                  # wrong id never persisted as a resume id
+        self.assertEqual(res.session_id, "conv-1")                  # expected id stays the recorded one
+        self.assertIn("conv-OTHER", res.error)
+
+    def test_mismatch_only_in_result_event_also_detected(self):
+        lines = ['{"event":"init","conversation_id":"conv-1"}',
+                 '{"event":"result","result":{"conversation_id":"conv-2","status":"SUCCESS","response":"x"}}']
+        res, _ = agy_parse(lines, session_id="conv-1")
+        self.assertEqual(res.error_kind, "session_lost")
+
+    def test_resume_without_any_id_in_stream_is_not_flagged(self):
+        res, _ = agy_parse(['{"event":"result","result":{"status":"SUCCESS","response":"x"}}'], session_id="conv-1")
+        self.assertTrue(res.ok)
+
+
+class TestAgyEffortAndErrors(unittest.TestCase):
+    def req(self, **kw):
+        base = dict(agent_id="a", prompt="p", cwd=".", session_id=None)
+        base.update(kw)
+        return TurnRequest(**base)
+
+    def test_effort_none_adds_no_flag(self):
+        inv = AgyAdapter(AgentCfg("a", "worker", "agy")).build(self.req(), ["agy"])
+        self.assertNotIn("--effort", inv.args)
+
+    def test_effort_high_adds_flag_both_modes(self):
+        ad = AgyAdapter(AgentCfg("a", "worker", "agy"))
+        inv = ad.build(self.req(effort="high"), ["agy"])
+        self.assertEqual(inv.args[inv.args.index("--effort") + 1], "high")
+        inv = ad.build(self.req(effort="high", prompt="x" * 7000), ["agy"])
+        self.assertIn("--input-format", inv.args)
+        self.assertEqual(inv.args[inv.args.index("--effort") + 1], "high")
+
+    def test_error_classification_stderr_and_result_error(self):
+        cases = [
+            (dict(stderr=["error: invalid effort level 'zzz'"]), "effort_invalid"),
+            (dict(stderr=["error: unknown model 'nope'"]), "model_invalid"),
+            (dict(stderr=["Error: model gemini-x does not support effort high"]), "effort_invalid"),
+        ]
+        for kw, kind in cases:                                      # (a) stderr, no official events
+            res, _ = agy_parse([], exit_code=2, **kw)
+            self.assertEqual(res.error_kind, kind, kw)
+            self.assertFalse(res.ok)
+        for err, kind in (("Model does not support effort 'high'", "effort_invalid"),   # (b) result.error
+                          ("Unknown model: nope", "model_invalid"),
+                          ("something else broke", "cli_error")):
+            res, _ = agy_parse(['{"event":"init","conversation_id":"c"}',
+                                json.dumps({"event": "result", "result": {"conversation_id": "c", "status": "ERROR", "error": err}})])
+            self.assertEqual(res.error_kind, kind, err)
+            self.assertIn(err, res.error)                           # the real CLI message is passed on
+
+
+class TestAgyDenials(unittest.TestCase):
+    def test_soft_denial_on_stderr_with_exit_zero(self):
+        res, _ = agy_parse(OFFICIAL_OK, stderr=["tool run_command auto-denied in headless mode (soft denial)"], exit_code=0)
+        self.assertTrue(res.ok)
+        self.assertEqual(len(res.denials), 1)
+        self.assertIn("auto-denied", res.denials[0])
+
+    def test_tool_info_error_with_denial_evidence(self):
+        lines = ['{"event":"init","conversation_id":"c"}',
+                 '{"event":"step_update","step_type":"tool_call","tool_info":{"name":"write_file","error":"Tool call denied by policy: requires approval"}}',
+                 '{"event":"result","result":{"conversation_id":"c","status":"SUCCESS","response":"claimed done"}}']
+        res, _ = agy_parse(lines)
+        self.assertTrue(res.ok)
+        self.assertEqual(len(res.denials), 1)
+        self.assertIn("write_file", res.denials[0])
+
+    def test_ordinary_tool_errors_are_not_denials(self):
+        lines = ['{"event":"init","conversation_id":"c"}',
+                 '{"event":"step_update","step_type":"tool_call","tool_info":{"name":"read_file","error":"ENOENT: no such file"}}',
+                 '{"event":"step_update","step_type":"tool_call","tool_info":{"name":"read_file","error":"EACCES: permission denied, open x"}}',
+                 '{"event":"result","result":{"conversation_id":"c","status":"SUCCESS","response":"r"}}']
+        res, _ = agy_parse(lines, stderr=["warn: operation not permitted on socket", "retrying after timeout"])
+        self.assertEqual(res.denials, [])
+
+
+class TestAgyViaSubprocess(unittest.TestCase):
+    """Real subprocess runner against tests/fake_agy.py (official-shaped events)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="agy fake 測試 "))
+        self.log = self.tmp / "log.jsonl"
+        os.environ["FAKE_AGY_LOG"] = str(self.log)
+        self.ad = AgyAdapter(AgentCfg("w1", "worker", "agy", command=str(Path(__file__).with_name("fake_agy.py"))))
+
+    def tearDown(self):
+        os.environ.pop("FAKE_AGY_MODE", None)
+
+    def run_turn(self, mode="ok", **kw):
+        os.environ["FAKE_AGY_MODE"] = mode
+        base = dict(agent_id="w1", prompt="多行\n提示", cwd=str(self.tmp), session_id=None, timeout=20)
+        base.update(kw)
+        saved = []
+        res = self.ad.run(TurnRequest(**base), threading.Event(), saved.append)
+        calls = [json.loads(l) for l in self.log.read_text(encoding="utf-8").splitlines()]
+        return res, saved, calls
+
+    def test_success_first_then_resume(self):
+        res, saved, calls = self.run_turn()
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual((saved, res.session_id), (["conv-new-1"], "conv-new-1"))
+        self.assertEqual(calls[0]["argv"][:2], ["-p", "多行\n提示"])
+        res, saved, calls = self.run_turn(session_id="conv-new-1", effort="high")
+        self.assertTrue(res.ok)
+        a = calls[-1]["argv"]
+        self.assertEqual(a[a.index("--conversation") + 1], "conv-new-1")
+        self.assertEqual(a[a.index("--effort") + 1], "high")
+        self.assertEqual(saved, [])
+
+    def test_stdin_mode_resume_sends_prompt_only_on_stdin(self):
+        self.ad.cfg.options["stdin_mode"] = "always"
+        res, _, calls = self.run_turn(session_id="conv-new-1")
+        self.assertTrue(res.ok, res.error)
+        self.assertNotIn("-p", calls[0]["argv"])
+        self.assertEqual(json.loads(calls[0]["stdin"])["message"]["content"], "多行\n提示")
+
+    def test_conversation_switch_is_session_lost(self):
+        res, saved, _ = self.run_turn("other_conv", session_id="conv-new-1")
+        self.assertEqual(res.error_kind, "session_lost")
+        self.assertEqual(saved, [])
+
+    def test_error_modes(self):
+        for mode, kind in (("effort_err_stderr", "effort_invalid"), ("effort_err_result", "effort_invalid"),
+                           ("model_err_stderr", "model_invalid"), ("model_err_result", "model_invalid"),
+                           ("error_status", "cli_error"), ("no_result", "no_output")):
+            res, _, _ = self.run_turn(mode, effort="high" if "effort" in mode else None,
+                                      model="m" if "model" in mode else None)
+            self.assertFalse(res.ok, mode)
+            self.assertEqual(res.error_kind, kind, mode + str(res.error))
+
+    def test_stderr_soft_denial_with_success(self):
+        res, _, _ = self.run_turn("denial_stderr")
+        self.assertTrue(res.ok)
+        self.assertTrue(res.denials)
+
+    def test_timeout_and_cancel_still_reported(self):
+        res, _, _ = self.run_turn("sleep", timeout=1.0)
+        self.assertEqual(res.error_kind, "timeout")
+        self.assertTrue(res.error)
+        os.environ["FAKE_AGY_MODE"] = "sleep"
+        cancel = threading.Event()
+        threading.Timer(0.8, cancel.set).start()
+        res = self.ad.run(TurnRequest("w1", "p", str(self.tmp), None, timeout=30), cancel, lambda s: None)
+        self.assertEqual(res.error_kind, "cancelled")
+        self.assertTrue(res.error)
 
 
 class TestConfig(unittest.TestCase):

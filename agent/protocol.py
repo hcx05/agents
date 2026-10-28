@@ -241,6 +241,13 @@ Action types:
   ask_user : {{"type":"ask_user","text":"<question for the human>"}}   (must be the ONLY action in the message)
   final    : {{"type":"final","text":"<final report for the human>"}}  (must be the ONLY action in the message)
 
+Delegation principles (you decide; delegating is optional):
+  - Do simple, short, direct tasks yourself and answer with 'final'; no worker is needed.
+  - If the user explicitly asks YOU to do something, do it yourself.
+  - Dispatch only when a worker brings real capability, quality or speed. Each dispatch costs CLI start-up latency, model usage and context.
+  - Having a worker is not a reason to use it. You may work yourself while a worker handles another part.
+  - You stay responsible for verifying worker results and for the final report.
+
 Rules:
   - Input arrives as tagged blocks: [from user], [user answer], [from <worker> | task <id> | status <s>], [system].
   - After a dispatch, return actions=[] (or more dispatch/answer) and wait; the worker's report arrives as your next input.
@@ -271,7 +278,8 @@ def fmt_mail(mails: List[Dict[str, Any]]) -> str:
     for m in mails:
         k = m["kind"]
         if k == "user":
-            parts.append(f"[from user]\n{m['text']}")
+            tag = "[from user | sent earlier while you were busy]" if m.get("queued") else "[from user]"
+            parts.append(f"{tag}\n{m['text']}")
         elif k == "user_answer":
             parts.append(f"[user answer to your ask_user]\n{m['text']}")
         elif k == "worker":

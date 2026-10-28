@@ -4,7 +4,7 @@
     python probe.py claude                 # default small set
     python probe.py agy
     python probe.py claude --tests version,schema,resume,badmodel,effort,perm,interrupt
-    python probe.py agy --tests version,help,plain,resume,stdin,stdin-conv,stdin-schema,badmodel,interrupt
+    python probe.py agy --tests version,help,plain,resume,stdin,stdin-conv,stdin-schema,badmodel,effort,perm,interrupt
     python probe.py agy --command "C:\\path\\to\\agy.exe"
 
 Nothing dangerous is run: the only "write" test asks for a file in the temp folder and EXPECTS a
@@ -155,6 +155,16 @@ def probe_agy(prefix, cwd, tests):
     if "badmodel" in tests:
         r = ad.run(TurnRequest("probe", "hi", cwd, None, model="no-such-model-xyz", timeout=120), threading.Event(), lambda s: None)
         record("agy invalid model reported (no fallback)", "PASS" if not r.ok else "FAIL", f"{r.error_kind}: {(r.error or '')[:80]}")
+    if "effort" in tests:
+        r = ad.run(TurnRequest("probe", "hi", cwd, None, effort="not-an-effort", timeout=120), threading.Event(), lambda s: None)
+        record("agy invalid effort reported (no downgrade)", "PASS" if r.error_kind == "effort_invalid" else "FAIL",
+               f"{r.error_kind}: {(r.error or '')[:100]}")
+    if "perm" in tests:
+        r = ad.run(TurnRequest("probe", "Use a tool to create a file named probe_out.txt containing hi, then reply done.",
+                               cwd, None, timeout=180), threading.Event(), lambda s: None)
+        created = (Path(cwd) / "probe_out.txt").exists()
+        record("agy permission denial detection", "PASS" if (r.denials or created) else "UNKNOWN",
+               f"denials={r.denials} file_created={created} (UNKNOWN = no denial text matched; share stderr)")
     if "interrupt" in tests:
         probe_interrupt(ad, cwd)
 
@@ -194,7 +204,7 @@ def _alive(pid):
 
 
 DEFAULTS = {"claude": "version,schema,resume,badmodel,effort,perm,interrupt",
-            "agy": "version,help,plain,resume,stdin,stdin-conv,stdin-schema,badmodel,interrupt"}
+            "agy": "version,help,plain,resume,stdin,stdin-conv,stdin-schema,badmodel,effort,perm,interrupt"}
 
 
 def main():

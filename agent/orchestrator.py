@@ -295,7 +295,12 @@ class Engine:
             self.ui.system("Nothing is running.")
             return
         self._cancel_all()
+        dropped = [m["text"] for m in self.mgr.inbox + self.held if m["kind"] in ("user", "user_answer")]
         closed = self._clear_work("interrupted")
+        if dropped:
+            self.store.log("interrupt_dropped_messages", texts=dropped)
+            self.ui.system("Discarded %d queued message(s) of yours (resend if needed): %s"
+                           % (len(dropped), " | ".join(t[:60] for t in dropped)))
         self.pending_notes.append(
             "The user INTERRUPTED the previous work with /interrupt. Tasks marked interrupted: "
             f"{closed or 'none'}. Workers were stopped; files were NOT rolled back. Do not assume anything completed.")
@@ -323,6 +328,8 @@ class Engine:
             return
         for a in self.agents.values():
             if a.running is None and a.inbox:
+                if a is self.mgr and self.awaiting_user:
+                    continue  # manager is paused until the user answers; nothing may start it early
                 self._start_turn(a)
 
     def _team_status_line(self) -> str:
@@ -507,6 +514,14 @@ class Engine:
                 self._say("Manager", x["text"], to=x["to"])
                 self.agents[x["to"]].inbox.append({"kind": "answer", "task_id": x["task_id"], "text": x["text"]})
             elif t == "ask_user":
+                # Everything already queued for the manager (user messages sent while it was busy, worker
+                # reports) must wait behind the question, in arrival order. Earlier user messages are NOT
+                # the answer; they are delivered after it, marked as queued.
+                for m in self.mgr.inbox:
+                    if m["kind"] == "user":
+                        m["queued"] = True
+                self.held = self.mgr.inbox + self.held
+                self.mgr.inbox = []
                 self.awaiting_user = {"text": x["text"], "ts": time.time()}
                 self.store.update(awaiting_user=self.awaiting_user)
                 self.store.log("ask_user", text=x["text"])

@@ -455,3 +455,140 @@ class TestSessionsAndStorage(FlowBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAskUserQueueing(FlowBase):
+    """Deterministic ordering: fake steps block on flag files that the test creates."""
+
+    def _flag(self, r, name):
+        (r.cwd / name).write_text("go", encoding="utf-8")
+
+    def _mgr_running(self, r):
+        self.assertTrue(r.wait_until(lambda: r.engine.agents["manager"].running is not None))
+
+    def test_30_plain_ask_user_manager_not_restarted_until_answer(self):
+        self.rig = r = Rig({"manager": [M([ask("確定嗎？")]), M([final("好")])], "w1": []})
+        r.say("做事")
+        self.assertEqual(r.engine.state, State.WAITING_USER)
+        self.assertEqual(len(r.calls("manager")), 1)
+        r.say("確定")
+        self.assertIn("[user answer to your ask_user]\n確定", r.calls("manager")[1]["prompt"])
+        self.assertEqual(r.engine.state, State.DONE)
+        self.assertNoIllegalTransitions()
+
+    def test_31_message_queued_before_question_is_not_the_answer_and_not_lost(self):
+        self.rig = r = Rig({"manager": [M([ask("可以刪除嗎？")], wait_for_file="m1.flag"),
+                                        M([final("已處理答案與先前訊息")])], "w1": []})
+        r.engine.submit("任務 A")
+        self._mgr_running(r)
+        r.engine.submit("追加訊息 B")                       # arrives while the manager is busy
+        self.assertTrue(r.wait_until(lambda: "queued" in " ".join(r.ui.texts("system"))))
+        self._flag(r, "m1.flag")                            # now the manager asks the question
+        self.assertTrue(r.wait_until(lambda: r.engine.state == State.WAITING_USER))
+        self.assertTrue(r.engine.wait_idle(10))
+        self.assertEqual(len(r.calls("manager")), 1)        # B did not wake the manager early
+        self.assertEqual(r.engine.status_text().count("queued=0"), 2)   # B is parked, not in the inbox
+        r.say("答案 C")
+        p = r.calls("manager")[1]["prompt"]
+        self.assertIn("[user answer to your ask_user]\n答案 C", p)
+        self.assertIn("[from user | sent earlier while you were busy]\n追加訊息 B", p)
+        self.assertLess(p.index("答案 C"), p.index("追加訊息 B"))   # answer first, queued message after
+        self.assertEqual(len(r.calls("manager")), 2)
+        self.assertEqual(r.engine.state, State.DONE)
+        self.assertNoIllegalTransitions()
+
+    def test_32_worker_report_interleaved_with_ask_user_is_held_not_lost(self):
+        self.rig = r = Rig({
+            "manager": [M([dispatch("w1", "t1", "工作")]),
+                        M([ask("worker 做完前先問你：要繼續嗎？")], wait_for_file="m2.flag"),
+                        M([final("全部處理完")])],
+            "w1": [W("done", "t1", "worker 的結果", wait_for_file="w1.flag")],
+        })
+        r.engine.submit("開始")
+        self.assertTrue(r.wait_until(lambda: r.engine.agents["w1"].running is not None))
+        r.engine.submit("使用者追加 B")                      # manager idle -> starts turn 2 (blocked on m2.flag)
+        self.assertTrue(r.wait_until(lambda: len(r.calls("manager")) == 2))
+        self._flag(r, "w1.flag")                            # worker reports while manager turn 2 is running
+        self.assertTrue(r.wait_until(lambda: r.store.state["tasks"]["t1"]["status"] == "done"))
+        self.assertTrue(r.wait_until(lambda: any(m["kind"] == "worker" for m in r.engine.mgr.inbox)))
+        self._flag(r, "m2.flag")                            # manager now asks the user
+        self.assertTrue(r.wait_until(lambda: r.engine.state == State.WAITING_USER))
+        self.assertTrue(r.engine.wait_idle(10))
+        self.assertEqual(len(r.calls("manager")), 2)         # report did not restart the manager
+        r.say("繼續")
+        p = r.calls("manager")[2]["prompt"]
+        self.assertLess(p.index("[user answer"), p.index("[from w1 | task t1 | status done]"))
+        self.assertIn("worker 的結果", p)
+        self.assertEqual(r.engine.state, State.DONE)
+        self.assertNoIllegalTransitions()
+
+    def test_33_worker_report_while_waiting_for_user_is_delivered_after_answer(self):
+        self.rig = r = Rig({
+            "manager": [M([dispatch("w1", "t1", "工作")]),
+                        M([ask("先問你")]),
+                        M([final("OK")])],
+            "w1": [W("done", "t1", "晚到的結果", wait_for_file="w1.flag")],
+        })
+        r.engine.submit("開始")
+        self.assertTrue(r.wait_until(lambda: r.engine.agents["w1"].running is not None))
+        r.engine.submit("再問一件事")                        # manager turn 2 -> ask_user (worker still running)
+        self.assertTrue(r.wait_until(lambda: r.engine.state == State.WAITING_USER))
+        self._flag(r, "w1.flag")                            # worker finishes during the question
+        self.assertTrue(r.wait_until(lambda: r.store.state["tasks"]["t1"]["status"] == "done"))
+        self.assertTrue(r.engine.wait_idle(10))
+        self.assertEqual(r.engine.state, State.WAITING_USER)
+        self.assertEqual(len(r.calls("manager")), 2)
+        r.say("好")
+        p = r.calls("manager")[2]["prompt"]
+        self.assertIn("晚到的結果", p)
+        self.assertLess(p.index("[user answer"), p.index("晚到的結果"))
+        self.assertEqual(r.engine.state, State.DONE)
+
+    def test_34_interrupt_while_waiting_for_user(self):
+        self.rig = r = Rig({"manager": [M([ask("q?"), ], wait_for_file="m.flag"), M([final("恢復")])], "w1": []})
+        r.engine.submit("任務")
+        self._mgr_running(r)
+        r.engine.submit("排隊的 B")
+        self.assertTrue(r.wait_until(lambda: "queued" in " ".join(r.ui.texts("system"))))
+        self._flag(r, "m.flag")
+        self.assertTrue(r.wait_until(lambda: r.engine.state == State.WAITING_USER))
+        r.engine.interrupt()
+        self.assertTrue(r.engine.wait_idle(10))
+        self.assertEqual(r.engine.state, State.INTERRUPTED)
+        self.assertIsNone(r.engine.awaiting_user)
+        self.assertTrue(any("排隊的 B" in t for t in r.ui.texts("system")))   # user told what was discarded
+        r.say("新的輸入")                                    # a fresh message, NOT an answer
+        p = r.calls("manager")[1]["prompt"]
+        self.assertIn("[from user]\n新的輸入", p)
+        self.assertNotIn("[user answer", p)
+        self.assertIn("INTERRUPTED", p)
+        self.assertEqual(r.engine.state, State.DONE)
+        self.assertNoIllegalTransitions()
+
+
+class TestDelegationChoice(FlowBase):
+    def test_40_manager_completes_directly_without_worker(self):
+        self.rig = r = Rig({"manager": [M([final("2+2=4")], say="簡單，我自己做")], "w1": []})
+        r.say("2+2 等於多少？")
+        self.assertEqual(r.calls("w1"), [])
+        self.assertEqual(r.store.state["tasks"], {})
+        self.assertEqual(r.engine.state, State.DONE)
+        self.assertEqual(r.chat_lines(), ["Manager> 簡單，我自己做", "Manager> @Me 2+2=4"])
+        self.assertNoIllegalTransitions()
+
+    def test_41_manager_delegates_then_reports(self):
+        self.rig = r = Rig({"manager": [M([dispatch("w1", "t1", "分析")]), M([final("整合後的報告")])],
+                            "w1": [W("done", "t1", "分析結果")]})
+        r.say("大任務")
+        self.assertEqual(len(r.calls("w1")), 1)
+        self.assertEqual(r.store.state["tasks"]["t1"]["status"], "done")
+        self.assertIn("分析結果", r.calls("manager")[1]["prompt"])
+        self.assertEqual(r.engine.state, State.DONE)
+        self.assertNoIllegalTransitions()
+
+    def test_42_preamble_states_delegation_principles(self):
+        from agent import protocol
+        p = protocol.manager_preamble("manager", [("w1", "agy")])
+        for needle in ("Do simple, short, direct tasks yourself", "explicitly asks YOU", "start-up latency",
+                       "Having a worker is not a reason", "verifying worker results"):
+            self.assertIn(needle, p)

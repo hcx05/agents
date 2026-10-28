@@ -54,7 +54,7 @@ Agent 工作時你可以繼續輸入；Manager 忙碌時訊息會排隊。每次
 
 程式**不會**加入 `--dangerously-skip-permissions`、`--permission-mode`、`--allowedTools`、`--sandbox`、`--bare`，
 也不修改官方 CLI 的設定。headless 模式下 CLI 拒絕的工具呼叫會被偵測（Claude：`permission_denials`；
-agy：stderr soft-denial 文字，啟發式），並以 `blocked` 證據回報給 Manager——即使 Worker 自稱 done 也會改為 blocked。
+agy：stderr 與 `step_update.tool_info.error` 中的明確拒絕文字，啟發式），並以 `blocked` 證據回報給 Manager——即使 Worker 自稱 done 也會改為 blocked。
 Manager 再告訴你需要怎麼授權。Manager 被指示在刪除/覆寫/部署/推送/付款前先 `ask_user`，
 這是**應用層規則**，無法攔截 CLI 內部所有工具呼叫。
 
@@ -106,12 +106,13 @@ Ctrl+Break/taskkill 清理（agy 另測 `--conversation`/`--json-schema` 是否�
 | Fake CLI 全流程測試（Linux） | 通過 |
 | 真實 Claude Code 2.1.312（Linux）：stream-json+`--json-schema`、stdin prompt、`--session-id`/`--resume`、無效模型/effort 偵測、權限拒絕偵測、中斷、完整聊天室（Manager+Worker 皆 Claude）| 通過 |
 | **Windows 原生**（subprocess、`.cmd` shim、Ctrl+Break/taskkill、主控台 UTF-8/ANSI） | **尚未實測**，程式已依 Windows 行為撰寫，請跑 `probe.py` |
-| **agy 1.4.9** 事件格式、`--conversation`、`--json-schema`、stdin streaming 組合、model/effort 旗標 | **尚未實測**（開發環境沒有 agy）。解析器採寬鬆啟發式；effort 對 agy 會明確報「不支援」 |
+| **agy 1.4.9** 官方 `init→step_update→result` 解析、`--effort` 傳遞、`--conversation` 一致性防護 | 僅以官方格式的模擬事件與 `tests/fake_agy.py` 測試；**未用真實 agy 驗證** |
+| agy `--conversation` ＋ stdin streaming、`--json-schema`、soft-denial 實際文字、Windows 行為 | **尚未實測**，請跑 `py probe.py agy` |
 | Codex、多 Worker、`/resume` | 依規格不做 |
 
 ## 已知限制
 
-- agy 的事件結構與旗標未驗證（見上）；若 `probe.py agy` 顯示抓不到 session id，請把印出的事件貼回來調整 `agent/adapters/agy.py`。
+- agy 只以模擬事件測試（見上）；權限拒絕偵測僅辨識明確的政策/核准拒絕字樣，一般 EACCES 等工具錯誤不算。若 `probe.py agy` 結果不符，請貼回輸出調整 `agent/adapters/agy.py`。
 - `writes` 欄位只是告知 Worker 的允許範圍並用於事後比對檔案變動，**無法強制**。
 - 同時有 Manager 與 Worker 在跑時，檔案快照無法區分是誰改的。
 - `timeout` 是每個 turn 的總時間上限（`turn_timeout_sec`），沒有另外的「無輸出」偵測。

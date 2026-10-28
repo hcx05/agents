@@ -5,7 +5,7 @@ Mimics `claude -p --output-format stream-json --verbose` closely enough for the 
 Env: FAKE_SCENARIO (json: {"<agent id>": [step, ...]}), FAKE_STATE (dir for counters/sessions/calls).
 Step keys: reply(obj) | text(str) | sleep(sec) | exit(code) | stderr(str) | raw_stdout([str]) |
            denial([{tool_name,tool_input}]) | expect_prompt_contains([str]) | expect_turn(int) |
-           write_file({path,content}) | is_error(str) | forget_sessions_of(agent id)
+           write_file({path,content}) | is_error(str) | forget_sessions_of(agent id) | wait_for_file(path relative to cwd)
 """
 import json
 import os
@@ -109,6 +109,10 @@ def main():
     if "expect_turn" in step and step["expect_turn"] != sess["turns"]:
         sys.stderr.write(f"fake_cli: ASSERT turn {sess['turns']} != {step['expect_turn']}\n")
         return 9
+    if step.get("wait_for_file"):   # deterministic ordering for tests: block until the test creates this file
+        end = time.time() + 60
+        while not os.path.exists(step["wait_for_file"]) and time.time() < end:
+            time.sleep(0.02)
     if step.get("sleep"):
         end = time.time() + float(step["sleep"])
         while time.time() < end:
