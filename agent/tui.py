@@ -14,11 +14,12 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.filters import Condition
+from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Dimension, FormattedTextControl, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
@@ -26,6 +27,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 
+from .inputhistory import HISTORY_LIMIT
 from .orchestrator import fmt_elapsed, fmt_quiet, model_label
 from .ui import UI
 
@@ -303,8 +305,9 @@ STYLE = Style.from_dict({
 })
 
 TITLE = "Agent 聊天室（輸入送給 Manager，不是 PowerShell）"
-KEYS = ("Enter 送出 | Ctrl+J 換行 | PgUp/PgDn 捲動 | End 最新 | Ctrl+C 中斷 | /exit 離開",
-        "Enter 送出 | Ctrl+J 換行 | PgUp/PgDn 捲動 | /exit 離開",
+KEYS = ("Enter 送出 | Ctrl+J 換行 | Up/Down 或 Ctrl+P/N 歷史 | PgUp/PgDn 捲動 | End 最新 | Ctrl+C 中斷 | /exit 離開",
+        "Enter 送出 | Ctrl+J 換行 | Up/Down 歷史 | PgUp/PgDn 捲動 | /exit 離開",
+        "Enter 送出 | Ctrl+J 換行 | Up/Down 歷史 | /exit 離開",
         "Enter 送出 | Ctrl+J 換行 | /exit 離開")
 
 
@@ -364,13 +367,18 @@ class TuiApp:
     submitted message; `on_ctrl_c()` returns True when it did something (e.g. interrupted a running turn)."""
 
     def __init__(self, on_line: Callable[[str], None], status: Callable[[], Dict[str, Any]],
-                 on_ctrl_c: Callable[[], bool], input=None, output=None) -> None:
+                 on_ctrl_c: Callable[[], bool], input=None, output=None, history: Sequence[str] = ()) -> None:
         self.on_line = on_line
         self._status = status
         self.on_ctrl_c = on_ctrl_c
         self.view = ChatView()
         self.ui = TuiUI(self.view, self.invalidate)
+        # Up / Down / Ctrl+P / Ctrl+N are prompt_toolkit's own history keys (Up and Down move the cursor inside a
+        # multi-line draft first), and the unsent draft stays at the newest position. Only what the user SENT is
+        # added; picking an entry just fills the box, nothing is submitted until Enter.
+        self._history: List[str] = [h for h in history if isinstance(h, str) and h.strip()][-HISTORY_LIMIT:]
         self.input = TextArea(multiline=True, wrap_lines=True, height=Dimension(min=1, max=6), dont_extend_height=True,
+                              history=InMemoryHistory(self._history),
                               complete_while_typing=False, focus_on_click=True,
                               get_line_prefix=lambda n, wrap: "Me> " if n == 0 and wrap == 0 else "    ")
         kb = self._bindings()
@@ -420,12 +428,23 @@ class TuiApp:
         running = any(a.get("running") for a in snap.get("agents") or [])
         return [("class:status.run" if running else "class:status", " " + status_line(snap, self.view) + " ")]
 
+    def _remember(self, s: str) -> None:
+        """Add one sent message (slash commands included: this lives in memory only). An immediate repeat is not added
+        twice, and only the newest HISTORY_LIMIT entries are kept. The history object is replaced rather than edited
+        so no private prompt_toolkit state is touched; the buffer reloads it on its next repaint."""
+        if self._history and self._history[-1] == s:
+            return
+        self._history.append(s)
+        del self._history[:-HISTORY_LIMIT]
+        self.input.buffer.history = InMemoryHistory(self._history)
+
     def submit(self) -> None:
         text = self.input.text
         self.input.buffer.reset()
         s = text.strip()
         if not s:
             return
+        self._remember(s)
         self.view.to_bottom()
         self.ui.echo_me(s, None if s.startswith("/") else "Manager")
         self.on_line(s)
@@ -442,6 +461,14 @@ class TuiApp:
         @kb.add("escape", "enter")
         def _(event):                                   # Ctrl+J / Alt+Enter: newline (Shift+Enter is not relied on)
             event.current_buffer.insert_text("\n")
+
+        @kb.add("c-p")
+        def _(event):                                   # prompt_toolkit's own Ctrl+P is Up (cursor line first): make it a jump
+            event.current_buffer.history_backward(count=event.arg)
+
+        @kb.add("c-n")
+        def _(event):
+            event.current_buffer.history_forward(count=event.arg)
 
         @kb.add("pageup")
         def _(event):

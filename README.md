@@ -52,6 +52,12 @@ agent                           # 全螢幕；agent --plain 強制簡易模式�
 - **固定在底部的輸入框**，上方一行標明「Agent 聊天室（輸入送給 Manager，不是 PowerShell）」。Agent 工作時可繼續輸入，新訊息不會動到你正在打的字。
 - 按鍵：`Enter` 送出；`Ctrl+J`（或 `Alt+Enter`）換行，**不依賴 Shift+Enter**；`PgUp` / `PgDn` 捲動歷史；`End`（輸入框空白時）或 `Ctrl+End` 回到最新；
   `Ctrl+C` 在有工作進行時等同 `/interrupt`，否則清除輸入框草稿；`Ctrl+D`（輸入框空白）離開；`/exit` 離開。貼上多行文字不會觸發送出。
+- **輸入歷史**：`Up` / `Down` 瀏覽你先前送出的訊息（多行草稿內先正常移動游標，到第一行才往更舊的歷史、到最後一行才往較新的歷史）；
+  `Ctrl+P` / `Ctrl+N` 不管游標在哪一行都直接跳到上一筆／下一筆。尚未送出的草稿會保留，回到最新位置時還原。帶回輸入框的歷史可以先修改，
+  按 `Enter` 才會送出（選取歷史本身不會呼叫模型、不會寫入紀錄、不會執行 `/status` 之類指令）。連續兩次送出相同內容只記一筆；最多保留最近 200 筆。
+  `agent resume <id>` 會從該 Session 的 `events.jsonl` 讀回你先前的訊息（只取 `chat` 事件中 `sender` 為 `Me` 者，最近 200 筆；已被遮蔽成 `[REDACTED]` 的整則略過；
+  不讀 Manager／Worker／系統訊息、原始輸出或 Claude 原生紀錄），`--replay 0` 只是不重播畫面，仍可按 `Up`。斜線指令只在同一次執行中可回溯，resume 後不會恢復。
+  不會建立任何新檔案，也不跨 Session。
 - 往上讀歷史時，新訊息**不會把畫面拉走**；狀態列會顯示「捲動中，N 則新訊息；End 回到最新」。送出訊息會自動回到最新。
 - **狀態列**（輸入框上方）：各 Agent 閒置／執行中、已執行時間、多久沒有新輸出、進行中的任務、佇列數，以及「等你回答」「已暫停」「Manager 等待 Worker」。
   只顯示 Engine 真正知道的事：Claude 回報的工具**名稱**（不含參數）才會出現，agy 與其他 CLI 不會有；**不會有**進度百分比、token 數或編造的動作。
@@ -254,6 +260,9 @@ agent                                  # 1. 應進入全螢幕；底部輸入框
 7. `agent sessions`，再 `agent resume <id>`：先前對話為暗色、左側有 `| `，標明唯讀；沒有任何模型被呼叫。`agent resume <id> --replay 0` 不顯示歷史。
 8. `agent --plain` 以及 `"/exit" | agent`（管線）都是原本的簡易模式。`py -m pip uninstall prompt_toolkit` 後執行 `agent`：stderr 提示安裝方式並退回簡易模式。
 9. 匯入：`agent <Claude UUID>` 的確認流程與之前相同；進入全螢幕後第一則訊息才建立 Fork。
+10. 輸入歷史（Batch 3B）：依序送出 `你好`、`第二則`、`第三則`；按三次 `Up` 依序出現 第三則、第二則、你好，再按 `Down` 往回；打一半的草稿在 `Up` 後再 `Down` 回到最新時要還原；
+    多行草稿（`Ctrl+J`）內 `Up` 先移動游標、到第一行才換歷史；`Ctrl+P` / `Ctrl+N` 直接換筆；選到 `/status` 時只是出現在輸入框，要按 `Enter` 才會執行；
+    `/exit` 後 `agent resume <id>`（以及加 `--replay 0`）按 `Up` 應取回先前送出的訊息，且不會自動送出、不產生新的對話或 turn。
 
 ## 已知限制
 
