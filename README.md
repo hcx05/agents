@@ -2,7 +2,8 @@
 
 你只跟 **Manager** 對話；Manager 可自己做事，或派工給 **Worker**。Worker 只對 Manager 提問/回報。
 所有 Agent 之間的對話都顯示在終端聊天室。Agent 直接呼叫各自官方 CLI（Claude Code、Antigravity `agy`），
-沿用它們的登入、權限與設定。只用 Python 標準函式庫，不需 API Key、資料庫或 Agent Framework。
+沿用它們的登入、權限與設定。不需 API Key、資料庫或 Agent Framework；唯一的第三方套件是全螢幕聊天室用的 `prompt_toolkit`
+（沒裝或不是終端機時自動退回簡易行模式）。
 
 ```
 Me> 幫我整理這個專案
@@ -36,7 +37,28 @@ agent                 # 進入聊天室（以目前資料夾為 Agent 的工作�
 聊天室指令：`/status`（狀態、各 Agent Session ID、未完成任務）、`/interrupt`（中斷正在跑的 turn；
 不假裝成功、不還原檔案，之後可繼續輸入）、`/exit`（清理子程序、存檔、離開）。
 Agent 工作時你可以繼續輸入；Manager 忙碌時訊息會排隊。每次 `agent` 都建立新對話。
-輸入僅支援單行（Enter 送出）。Agent 輸出會在你輸入一半時插入，這時提示字元會重畫、已打的字仍在輸入緩衝區。
+在真正的終端機（PowerShell / Windows Terminal）裡會進入**全螢幕聊天室**（見下節）；管線／重新導向、`--plain`、
+環境變數 `AGENT_PLAIN=1`、`TERM=dumb`、或沒安裝 `prompt_toolkit` 時，使用原本的簡易行模式（單行輸入，Enter 送出）。
+
+### 全螢幕聊天室（`prompt_toolkit`）
+
+```powershell
+py -m pip install -e .          # 會一併安裝 prompt_toolkit；或單獨：py -m pip install "prompt_toolkit>=3.0.36"
+agent                           # 全螢幕；agent --plain 強制簡易模式；agent resume <id> / agent <Claude UUID> 同樣適用
+```
+
+- **單一聊天室**：上方是依時間排序的對話（我→Manager、Manager 回覆、Manager→Worker 派工、Worker→Manager 回報、最終答覆、系統提示與錯誤），
+  每則標明來源與該回合的模型（CLI 回報／僅要求／未知）。沒有分割視窗、側欄或分頁。純文字、依顯示寬度換行（中文佔 2 格），視窗縮放後自動重排。
+- **固定在底部的輸入框**，上方一行標明「Agent 聊天室（輸入送給 Manager，不是 PowerShell）」。Agent 工作時可繼續輸入，新訊息不會動到你正在打的字。
+- 按鍵：`Enter` 送出；`Ctrl+J`（或 `Alt+Enter`）換行，**不依賴 Shift+Enter**；`PgUp` / `PgDn` 捲動歷史；`End`（輸入框空白時）或 `Ctrl+End` 回到最新；
+  `Ctrl+C` 在有工作進行時等同 `/interrupt`，否則清除輸入框草稿；`Ctrl+D`（輸入框空白）離開；`/exit` 離開。貼上多行文字不會觸發送出。
+- 往上讀歷史時，新訊息**不會把畫面拉走**；狀態列會顯示「捲動中，N 則新訊息；End 回到最新」。送出訊息會自動回到最新。
+- **狀態列**（輸入框上方）：各 Agent 閒置／執行中、已執行時間、多久沒有新輸出、進行中的任務、佇列數，以及「等你回答」「已暫停」「Manager 等待 Worker」。
+  只顯示 Engine 真正知道的事：Claude 回報的工具**名稱**（不含參數）才會出現，agy 與其他 CLI 不會有；**不會有**進度百分比、token 數或編造的動作。
+  過程中的工具事件不會變成聊天訊息。
+- **重播（resume）**：先前的對話以暗色並在左側加 `| ` 標示，前後有「以下是先前的對話／到此為止」分隔，唯讀、不呼叫模型、不重複寫入紀錄；`--replay 0` 完全不顯示。
+  原生 Claude Session 的歷史永遠不會被當成 Agent 聊天顯示。
+- 離開後回到一般終端機並印出 `Bye. Session saved … (resume with: agent resume <id>)`。畫面層出錯不會動到已保存的 Session（`finally` 仍會關閉 Engine、放掉鎖）。
 
 ### 恢復對話：`agent sessions` / `agent resume <id>`
 
@@ -209,7 +231,29 @@ Ctrl+Break/taskkill 清理（agy 另測 `--conversation`/`--json-schema` 是否�
 | **Windows 原生**（subprocess、`.cmd` shim、Ctrl+Break/taskkill、主控台 UTF-8/ANSI） | **尚未實測**，程式已依 Windows 行為撰寫，請跑 `probe.py` |
 | **agy 1.4.9** 官方 `init→step_update→result` 解析、`--effort` 傳遞、`--conversation` 一致性防護 | 僅以官方格式的模擬事件與 `tests/fake_agy.py` 測試；**未用真實 agy 驗證** |
 | agy `--conversation` ＋ stdin streaming、`--json-schema`、soft-denial 實際文字、Windows 行為 | **尚未實測**，請跑 `py probe.py agy` |
+| 全螢幕聊天室（`prompt_toolkit`）：Linux pseudo terminal＋腳本化按鍵（中文、`Ctrl+J`、括號貼上、捲動、背景訊息、重播、`/exit` 清理、非 TTY 退回簡易模式） | 通過 |
+| **全螢幕聊天室在 Windows 實機**（IME、貼上、縮放、按鍵辨識） | **尚未實測**，見上節手動驗收 |
 | Codex、多 Worker、`/resume` | 依規格不做 |
+
+### 全螢幕聊天室的 Windows 手動驗收（PowerShell）
+
+```powershell
+py -m pip install -e .
+py -m unittest tests.test_tui -v       # 自動化部分（不含 IME／真實視窗）
+agent                                  # 1. 應進入全螢幕；底部輸入框上方有「Agent 聊天室（輸入送給 Manager，不是 PowerShell）」
+```
+
+在聊天室內逐項確認（各項在 Windows Terminal 與傳統 PowerShell 視窗都試一次）：
+
+1. 用中文輸入法打「你好，請簡單介紹這個資料夾」，組字過程與送出正常；`Ctrl+J` 換行後再 `Enter`，Manager 收到的是同一則多行訊息。
+2. 從記事本複製 3 行文字貼上：不會自動送出，3 行都在輸入框，再按 `Enter` 才送出（若貼上時每行都被送出，請回報終端機種類）。
+3. 送出需要一點時間的任務（例如請 Manager 派工給 Worker），工作中繼續打字：新訊息出現時輸入框內的字不會被改動；狀態列顯示執行中、經過時間。
+4. `PgUp` 往上看歷史；工作中新訊息到達時畫面不會被拉到底部，狀態列提示新訊息數；按 `End` 回到最新。
+5. 拖動視窗改變大小、縮得很窄／放很寬：文字依寬度重排，中英混排與長行不超出邊界、不殘影。
+6. 工作進行中按 `Ctrl+C`：等同 `/interrupt`；之後 `/status` 正常，`/exit` 離開並回到一般 PowerShell 提示字元。
+7. `agent sessions`，再 `agent resume <id>`：先前對話為暗色、左側有 `| `，標明唯讀；沒有任何模型被呼叫。`agent resume <id> --replay 0` 不顯示歷史。
+8. `agent --plain` 以及 `"/exit" | agent`（管線）都是原本的簡易模式。`py -m pip uninstall prompt_toolkit` 後執行 `agent`：stderr 提示安裝方式並退回簡易模式。
+9. 匯入：`agent <Claude UUID>` 的確認流程與之前相同；進入全螢幕後第一則訊息才建立 Fork。
 
 ## 已知限制
 
@@ -217,6 +261,8 @@ Ctrl+Break/taskkill 清理（agy 另測 `--conversation`/`--json-schema` 是否�
 - `writes` 欄位只是告知 Worker 的允許範圍並用於事後比對檔案變動，**無法強制**。
 - 同時有 Manager 與 Worker 在跑時，檔案快照無法區分是誰改的。
 - `timeout` 是每個 turn 的總時間上限（`turn_timeout_sec`）。另有純提示用的「無輸出」提醒（`silence_warn_sec` 預設 60 秒、之後每 `silence_repeat_sec` 預設 300 秒最多一次，有新輸出即重算）；它不會中斷任務，也不代表模型正在「思考」，只表示 CLI 沒有新輸出。
-- 聊天室在等待輸入時若有非同步訊息（開始執行、提醒）插入，終端機的「正在輸入的文字」會暫時被清掉重畫提示列（文字仍在輸入緩衝區，按 Enter 照常送出）。標準函式庫的一般行輸入無法做到完整保留；完整方案（自製行編輯器或 prompt_toolkit）列為後續工作。
+- 簡易行模式（`--plain`、非終端機）在等待輸入時若有非同步訊息插入，「正在輸入的文字」會暫時被清掉重畫提示列（文字仍在輸入緩衝區，按 Enter 照常送出）；全螢幕模式沒有這個問題。
+- 全螢幕聊天室：中文輸入法（IME）組字、Windows Terminal 的貼上、視窗縮放、`Ctrl+J` 辨識，目前只在 Linux 的 pseudo terminal 與腳本化輸入下測過，**Windows 實機尚未驗證**（見下節的手動驗收步驟）。
+  畫面結構只用 ASCII 符號（避免 CJK 主控台把「模稜兩可寬度」符號畫成 2 格造成右邊界錯位）。不支援滑鼠、不渲染 Markdown。
 - 啟動時會在背景用官方 `--version` 記錄 CLI 版本（不耗額度、失敗不影響使用）；版本是否「已測試」見 `/status`，清單在 `agent/compat.py`，且不等於完全相容。
 - 中斷後，被中斷的 CLI Session 可能留有半截歷史；程式會告知 Manager「任務被中斷、檔案未還原」。

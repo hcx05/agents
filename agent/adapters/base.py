@@ -21,6 +21,7 @@ class TurnRequest:
     schema: Optional[Dict[str, Any]] = None
     timeout: float = 1800
     fork: bool = False                 # resume session_id as a COPY (--fork-session); only the first turn of an import
+    on_activity: Optional[Callable[[str], None]] = None   # called with a tool NAME when the CLI really starts one (display only)
     new_session_id: Optional[str] = None   # with fork: the UUID the fork MUST get (--session-id). Strict: any other id = fork_failed
 
 

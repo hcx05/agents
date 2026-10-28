@@ -70,6 +70,8 @@ class Running:
     req_effort: Optional[str] = None
     turn_id: str = ""
     sent_pre: bool = False       # this turn's prompt carried the team preamble
+    tool: Optional[str] = None   # name of the newest tool the CLI reported starting (claude only); display only
+    tool_at: float = 0.0         # engine clock of that report
 
 
 @dataclass
@@ -187,6 +189,7 @@ class Engine:
         self._stopped = False
         self.transitions_log: List[str] = []
         self.cli_versions: Dict[str, Dict[str, Any]] = {}
+        self._last_snapshot: Dict[str, Any] = {}
         self.on_tick: Optional[Callable[[], None]] = None   # called on every idle tick (the session-lock heartbeat)
         self.hold = False                              # after a resume: nothing starts until the user says so
         self.restore_report: List[str] = []            # what the resume found; the caller prints it through its UI
@@ -436,6 +439,33 @@ class Engine:
         if wait:
             th.join(timeout * 3 * max(1, len(self.agents)))
         return th
+
+    def activity_snapshot(self) -> Dict[str, Any]:
+        """Plain-data picture of what is running right now, for a UI status bar. Thread-safe and never blocks the UI for
+        long: if the engine holds its lock (e.g. while cancelling), the previous snapshot is returned. Only facts the
+        engine really has: no progress estimate, no token counts, tools only when the CLI reported one."""
+        if not self._lock.acquire(timeout=0.05):
+            return self._last_snapshot
+        try:
+            now = self.clock()
+            agents = []
+            for a in self.agents.values():
+                r = a.running
+                agents.append({
+                    "id": a.id, "name": self._display(a), "role": a.role, "cli": a.cfg.cli,
+                    "running": r is not None, "elapsed": (now - r.t0) if r else None,
+                    "quiet": (now - r.last_output) if r else None, "lines": r.lines if r else 0,
+                    "tool": r.tool if r else None, "tool_ago": (now - r.tool_at) if r and r.tool else None,
+                    "task": a.active_task if a.role == "worker" else None, "queued": len(a.inbox)})
+            open_t = [f"{tid}@{t['worker']}" for tid, t in self.tasks.items() if t["status"] in protocol.OPEN_TASK_STATES]
+            snap = {"state": self.state.value, "hold": self.hold, "awaiting_user": bool(self.awaiting_user),
+                    "open_tasks": open_t, "agents": agents,
+                    "import_stage": self.imp["stage"] if self.imp else None,
+                    "manager_turns": self.manager_turns}
+            self._last_snapshot = snap
+            return snap
+        finally:
+            self._lock.release()
 
     def _activity(self, a: AgentRT) -> str:
         r = a.running
@@ -837,6 +867,11 @@ class Engine:
     def _turn_thread(self, a: AgentRT, req: TurnRequest, cancel: threading.Event, epoch: int) -> None:
         diff: Optional[FileDiff] = None
         run = a.running
+
+        def on_activity(name: str) -> None:
+            if run is not None:
+                run.tool, run.tool_at = name, self.clock()
+        req.on_activity = on_activity
 
         def on_raw(stream: str, line: str) -> None:
             if run is not None:                    # plain attribute writes: no event is queued per CLI line

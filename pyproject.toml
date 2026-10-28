@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Hierarchical multi-agent chat room (Manager + Worker) on top of official AI CLIs"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["prompt_toolkit>=3.0.36"]
 
 [project.scripts]
 agent = "agent.__main__:main"

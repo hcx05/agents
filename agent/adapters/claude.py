@@ -108,6 +108,11 @@ class ClaudeParser(Parser):
             for blk in (ev.get("message") or {}).get("content") or []:
                 if isinstance(blk, dict) and blk.get("type") == "text":
                     self.assistant_text.append(blk.get("text", ""))
+                elif isinstance(blk, dict) and blk.get("type") == "tool_use" and self.req.on_activity:
+                    try:                                     # name only: tool inputs may hold secrets and are never shown
+                        self.req.on_activity(str(blk.get("name") or "?")[:40])
+                    except Exception:
+                        pass
         elif t == "user":
             for blk in (ev.get("message") or {}).get("content") or []:
                 if (isinstance(blk, dict) and blk.get("type") == "tool_result" and blk.get("is_error")

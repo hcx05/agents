@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import sys
+import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__, importer
 from .adapters import get_adapter
@@ -15,7 +17,7 @@ from .orchestrator import Engine
 from .resume import check_compat, format_sessions, replay, timeline
 from .sessionlock import SessionLock, SessionLocked
 from .store import Store, StoreError, safe_session_dir
-from .ui import ChatUI, RecordingUI
+from .ui import UI, ChatUI, RecordingUI
 
 HELP_IN_CHAT = "Commands: /status  /interrupt  /exit.  Anything else is sent to the Manager."
 HELP_RESUMED = ("Commands: /status  /continue  /interrupt  /exit.  /continue starts the work that was kept on hold; "
@@ -56,7 +58,22 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_slash(engine: Engine, ui: ChatUI, cmd: str) -> bool:
+def _tui_decision(args: argparse.Namespace) -> Tuple[bool, Optional[str]]:
+    """Full-screen chat room only for a real interactive terminal. Anything else (pipe, redirect, --plain, AGENT_PLAIN,
+    TERM=dumb, prompt_toolkit missing) gets the original line-based chat. Returns (use_tui, hint for stderr)."""
+    if getattr(args, "plain", False) or os.environ.get("AGENT_PLAIN") or os.environ.get("TERM", "").lower() == "dumb":
+        return False, None
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False, None
+    try:
+        importlib.import_module(f"{__package__}.tui")
+    except Exception as e:
+        return False, (f"全螢幕聊天室需要 prompt_toolkit（{type(e).__name__}: {e}）。改用簡易模式；"
+                       "要啟用全螢幕請執行：pip install \"prompt_toolkit>=3.0.36\"（或加 --plain 不再提示）")
+    return True, None
+
+
+def _run_slash(engine: Engine, ui: UI, cmd: str) -> bool:
     """Returns True when the chat should exit."""
     name = cmd.split()[0].lower()
     if name == "/exit":
@@ -71,6 +88,32 @@ def _run_slash(engine: Engine, ui: ChatUI, cmd: str) -> bool:
     else:
         ui.system(f"Unknown command {name}. {HELP_IN_CHAT}")
     return False
+
+
+def _tui_line(holder: Dict[str, Any], s: str) -> None:
+    """One submitted line from the full-screen input. Runs on the UI thread, so anything that can wait goes to a helper
+    thread; a plain message is just a queue put."""
+    engine, ui, app = holder["engine"], holder["ui"], holder["app"]
+    if not s.startswith("/"):
+        engine.submit(s)
+        return
+    name = s.split()[0].lower()
+    if name == "/exit":
+        app.request_exit()
+    elif name in ("/interrupt", "/status"):
+        threading.Thread(target=_run_slash, args=(engine, ui, s), daemon=True, name="slash").start()
+    else:
+        _run_slash(engine, ui, s)
+
+
+def _tui_ctrl_c(holder: Dict[str, Any]) -> bool:
+    """Ctrl+C in the full screen: interrupt running work. True when there was something to interrupt."""
+    snap = holder["status"]() or {}
+    busy = any(a.get("running") or a.get("queued") for a in snap.get("agents") or []) or snap.get("open_tasks")
+    if not busy:
+        return False
+    holder["engine"].interrupt()
+    return True
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
@@ -197,7 +240,19 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
         warns = []
         if imp_state is not None:
             store.update(**{"import": imp_state})          # the fork id is on disk before anything else happens
-    plain = ChatUI()
+    use_tui, hint = _tui_decision(args)
+    if hint:
+        print(hint, file=sys.stderr)
+    holder: Dict[str, Any] = {}
+    tuiapp = None
+    if use_tui:
+        try:
+            from .tui import TuiApp
+            tuiapp = TuiApp(lambda s: _tui_line(holder, s), lambda: holder["status"](), lambda: _tui_ctrl_c(holder))
+        except Exception as e:               # e.g. a console prompt_toolkit cannot drive (mintty): chat as before
+            print(f"全螢幕聊天室無法在這個終端啟動（{type(e).__name__}: {e}）。改用簡易模式（可加 --plain）。", file=sys.stderr)
+            tuiapp = None
+    plain = tuiapp.ui if tuiapp else ChatUI()
     ui = RecordingUI(plain, store)
     try:
         engine = Engine(cfg, store, ui, cwd, adapter_factory=lambda ac: adapters[ac.id], resume=resumed)
@@ -205,6 +260,7 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
         lock.release()
         raise
     engine.start()
+    holder.update(engine=engine, ui=ui, app=tuiapp, status=engine.activity_snapshot)
     mgr = cfg.agents[cfg.manager]
     ui.banner(["Agent Team",
                f"Manager: {adapters[mgr.id].display_name}" + (f" ({mgr.model})" if mgr.model else ""),
@@ -218,7 +274,8 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
     if resumed:
         if store.state.get("import"):
             plain.system(IMPORT_REPLAY_NOTE.format(src=store.state["import"]["source_id"]))
-        shown = replay(plain, timeline(Store.read_events(store.dir)), getattr(args, "replay", 60))
+        shown = replay(tuiapp.ui.replay_view() if tuiapp else plain, timeline(Store.read_events(store.dir)),
+                       getattr(args, "replay", 60))
         for w in warns:
             ui.system("注意：" + w)
         for kind, text in engine.restore_report:
@@ -227,6 +284,14 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
     interactive = sys.stdin.isatty()
     exit_code = 0
     try:
+        if tuiapp is not None:
+            try:
+                tuiapp.run()
+            except Exception as e:           # the screen failed; the engine and the saved session are untouched
+                exit_code = 1
+                print(f"全螢幕聊天室發生錯誤：{type(e).__name__}: {e}\n工作狀態已保存，可用 `agent resume {store.id}` "
+                      "繼續（加 --plain 使用簡易模式）。", file=sys.stderr)
+            return exit_code
         while True:
             try:
                 if not interactive:
@@ -254,7 +319,10 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
         pass
     finally:
         engine.shutdown()
-        ui.system(f"Bye. Session saved: {store.dir}" + (f"  (resume with: agent resume {store.id})"))
+        bye = f"Bye. Session saved: {store.dir}" + (f"  (resume with: agent resume {store.id})")
+        ui.system(bye)
+        if tuiapp is not None:
+            print(bye)                       # the full screen is gone: say it on the normal terminal
         lock.release()
     return exit_code
 
@@ -266,6 +334,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "Run `agent` to start; `agent config` shows/creates the config file.")
     p.add_argument("--version", action="version", version=f"agent {__version__}")
     p.add_argument("--config", help="use this config file instead of %%APPDATA%%\\agent\\config.json")
+    p.add_argument("--plain", action="store_true", default=False,
+                   help="line-based chat instead of the full-screen chat room (also used when not on a terminal)")
     sub = p.add_subparsers(dest="command")
     r = sub.add_parser("sessions", help="list saved Agent sessions")
     r.add_argument("--limit", type=int, default=20, help="show at most this many (newest)")
@@ -274,6 +344,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("session_id", help="Agent session id (see `agent sessions`)")
     r.add_argument("--replay", type=int, default=60, help="show the last N earlier chat items first (0 = none)")
     r.add_argument("--here", action="store_true", help="continue even though the current folder differs from the saved one")
+    r.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     r.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     i = sub.add_parser("import", help="import a native Claude Code session (also: agent <Claude Session UUID>): "
                                       "the Manager continues a COPY of it; the original is never modified")
@@ -282,6 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--here", action="store_true",
                    help="import even though the session seems to come from another folder (a guess from Claude's storage)")
     i.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    i.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     c = sub.add_parser("config", help="create the config file if missing and show its path")
     c.add_argument("--show", action="store_true", help="also print the file contents")
     c.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
