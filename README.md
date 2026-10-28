@@ -1,0 +1,118 @@
+# agent — 階級制 AI Agent 團隊（Windows Terminal CLI，MVP v1）
+
+你只跟 **Manager** 對話；Manager 可自己做事，或派工給 **Worker**。Worker 只對 Manager 提問/回報。
+所有 Agent 之間的對話都顯示在終端聊天室。Agent 直接呼叫各自官方 CLI（Claude Code、Antigravity `agy`），
+沿用它們的登入、權限與設定。只用 Python 標準函式庫，不需 API Key、資料庫或 Agent Framework。
+
+```
+Me> 幫我整理這個專案
+Manager> 我先分析專案結構。
+Manager> @w1 請檢查 logs 並整理異常。
+w1> @Manager 我需要確認 logs 的存放位置。
+Manager> @w1 請先檢查 logs/ 資料夾。
+w1> @Manager 已完成，發現三項異常。
+Manager> @Me 任務完成，以下是整理結果……
+```
+
+## 安裝（Windows PowerShell，Python 3.10+）
+
+```powershell
+cd <此專案資料夾>
+py -m pip install -e .
+agent --help
+```
+
+若 `agent` 找不到，把 `py -m site --user-base` 底下的 `Scripts` 資料夾加入 PATH，或改用 `py -m agent`。
+也可不安裝直接執行：`py -m agent`（在專案資料夾內）。
+
+## 使用
+
+```powershell
+agent config          # 建立（若不存在）並顯示 %APPDATA%\agent\config.json 的路徑與檢查結果
+agent config --show   # 另外印出內容
+agent                 # 進入聊天室（以目前資料夾為 Agent 的工作資料夾）
+```
+
+聊天室指令：`/status`（狀態、各 Agent Session ID、未完成任務）、`/interrupt`（中斷正在跑的 turn；
+不假裝成功、不還原檔案，之後可繼續輸入）、`/exit`（清理子程序、存檔、離開）。
+Agent 工作時你可以繼續輸入；Manager 忙碌時訊息會排隊。每次 `agent` 都建立新對話。
+輸入僅支援單行（Enter 送出）。Agent 輸出會在你輸入一半時插入，這時提示字元會重畫、已打的字仍在輸入緩衝區。
+
+### 設定檔 `%APPDATA%\agent\config.json`
+
+預設內容即規格中的設定（manager=`claude`、`w1`=`agy`）。`model`/`effort` 為 `null` 時沿用 CLI 預設；
+程式不寫死任何模型名稱。Manager 派工時可指定該 Worker 的 `model`/`effort`，未指定則用設定檔值。
+模型或 effort 無效時 CLI 會報錯，本程式原樣回報給 Manager/你，**不會**偷偷換模型。
+
+可選欄位（不在預設檔內）：
+- `agents.<id>.command`：CLI 執行檔完整路徑（PATH 找不到時用）。
+- `agents.<id>.options`：`extra_args`（額外 CLI 參數陣列）、agy 的 `stdin_mode`（`auto|always|never`）、`use_json_schema`。
+- `snapshot`：`{"enabled": true, "max_files": 20000, "max_seconds": 5}`。
+- 第一版固定 **1 個 Manager + 1 個 Worker**；Manager 與 Worker 可用同一種 CLI，各自有獨立 Session。
+
+## 權限
+
+程式**不會**加入 `--dangerously-skip-permissions`、`--permission-mode`、`--allowedTools`、`--sandbox`、`--bare`，
+也不修改官方 CLI 的設定。headless 模式下 CLI 拒絕的工具呼叫會被偵測（Claude：`permission_denials`；
+agy：stderr soft-denial 文字，啟發式），並以 `blocked` 證據回報給 Manager——即使 Worker 自稱 done 也會改為 blocked。
+Manager 再告訴你需要怎麼授權。Manager 被指示在刪除/覆寫/部署/推送/付款前先 `ask_user`，
+這是**應用層規則**，無法攔截 CLI 內部所有工具呼叫。
+
+## 儲存與隱私
+
+`%APPDATA%\agent\sessions\<時間>-<id>\`：
+- `state.json`（原子寫入）：各 Agent Session ID、任務、狀態、等待使用者的問題。
+- `events.jsonl`：聊天、狀態轉換、turn 結果、錯誤、檔案變動摘要。
+- `raw\<agent>.jsonl`：CLI 原始輸出（每行最多 2000 字、每檔最多 2 MB，並遮蔽常見金鑰/token/環境變數中的秘密）。
+
+遮蔽是盡力而為，**raw log 仍可能含有你的提示、檔案內容與路徑**，請把這個資料夾視為敏感資料。
+`AGENT_HOME` 環境變數可改變資料夾位置。
+
+## 運作方式（重點）
+
+- Manager 每個 turn 回傳 `{"say", "actions":[dispatch|answer|ask_user|final]}`，Worker 回傳
+  `{"status": done|question|blocked|failed, "task_id", "text", "files_touched"}`。
+  Claude 以 `--json-schema` 取得 `structured_output`；agy 以提示內嵌 JSON 並由本程式驗證。
+  Schema 驗證 + 程式層驗證（收件人、Task ID、狀態、`final` 不得在任務未結束時送出、不得 dispatch 給自己、
+  `ask_user`/`final` 必須單獨）。不合法時最多要求修正一次，仍不合法則該 turn 失敗並回到可操作狀態。
+- `ask_user`：顯示問題 → 暫停（Worker 回報暫存）→ 你的下一則輸入作為答案送回**同一個 Manager Session**。
+- 狀態機：`idle running waiting_worker waiting_manager waiting_user done blocked failed interrupted timeout`，
+  合法轉換表在 `orchestrator.py`，非法轉換會記錄為 `illegal_transition` 事件（測試斷言其為零）。
+- Session：Claude 首輪用我們產生的 `--session-id`，之後 `--resume`；agy 從事件取得 conversation id 後存檔，
+  之後 `--conversation`。無法續談（`session_lost`）會明確回報，不會悄悄開新對話。
+- 子程序：不使用 `shell=True`；prompt 走 stdin（Claude）或 `-p`/stdin streaming（agy，兩者不混用）；
+  `.cmd/.bat` 啟動器拒絕含 `" % ^ & | < > 換行` 的參數；`.ps1` 以 `powershell -File` 啟動。
+  Windows 以 `CREATE_NEW_PROCESS_GROUP` + `CTRL_BREAK_EVENT`，3 秒後仍未結束才對**本程式啟動的** PID 執行 `taskkill /PID <pid> /T /F`。
+- 檔案變動：每個 turn 前後做標準函式庫快照（略過 `.git`、`node_modules`、`.venv` 等、不跟隨符號連結、
+  有數量/時間上限，不完整會標示）。只表示「執行期間有變動」，不保證是該 Agent 造成；不會還原或刪除任何檔案。
+
+## 測試
+
+```powershell
+py -m unittest discover -s tests -t .        # Fake CLI：完整 Manager→Worker→Manager→User 流程，不耗額度
+py tests\demo.py                              # 離線示範聊天室
+py probe.py claude                            # 真實 CLI 探測（耗少量額度，在暫存資料夾）
+py probe.py agy
+```
+
+`probe.py` 會逐項輸出 PASS/FAIL：stream-json、JSON Schema、stdin、續談、無效模型/effort、權限拒絕偵測、
+Ctrl+Break/taskkill 清理（agy 另測 `--conversation`/`--json-schema` 是否能與 stdin streaming 搭配）。
+結果寫到 `%TEMP%\agent-probe-<cli>.json`。
+
+### 驗證狀態（誠實版）
+
+| 項目 | 狀態 |
+|---|---|
+| Fake CLI 全流程測試（Linux） | 通過 |
+| 真實 Claude Code 2.1.312（Linux）：stream-json+`--json-schema`、stdin prompt、`--session-id`/`--resume`、無效模型/effort 偵測、權限拒絕偵測、中斷、完整聊天室（Manager+Worker 皆 Claude）| 通過 |
+| **Windows 原生**（subprocess、`.cmd` shim、Ctrl+Break/taskkill、主控台 UTF-8/ANSI） | **尚未實測**，程式已依 Windows 行為撰寫，請跑 `probe.py` |
+| **agy 1.4.9** 事件格式、`--conversation`、`--json-schema`、stdin streaming 組合、model/effort 旗標 | **尚未實測**（開發環境沒有 agy）。解析器採寬鬆啟發式；effort 對 agy 會明確報「不支援」 |
+| Codex、多 Worker、`/resume` | 依規格不做 |
+
+## 已知限制
+
+- agy 的事件結構與旗標未驗證（見上）；若 `probe.py agy` 顯示抓不到 session id，請把印出的事件貼回來調整 `agent/adapters/agy.py`。
+- `writes` 欄位只是告知 Worker 的允許範圍並用於事後比對檔案變動，**無法強制**。
+- 同時有 Manager 與 Worker 在跑時，檔案快照無法區分是誰改的。
+- `timeout` 是每個 turn 的總時間上限（`turn_timeout_sec`），沒有另外的「無輸出」偵測。
+- 中斷後，被中斷的 CLI Session 可能留有半截歷史；程式會告知 Manager「任務被中斷、檔案未還原」。
