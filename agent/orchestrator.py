@@ -616,6 +616,13 @@ class Engine:
                                    "Review them, then issue 'final' again if still appropriate."})
             return
         say = obj["say"].strip()
+        closing = next((x for x in actions if x["type"] in ("final", "ask_user")), None)
+        if say and closing and protocol.say_duplicates(say, closing["text"]):
+            # 'say' only repeats the closing text: show it once, using the longer of the two
+            if len(say) > len(closing["text"].strip()):
+                actions = [dict(x, text=say) if x is closing else x for x in actions]
+            self.store.log("say_deduplicated", action=closing["type"])
+            say = ""
         if say:
             self._say("Manager", say)
         for x in actions:

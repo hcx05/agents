@@ -115,5 +115,7 @@ Ctrl+Break/taskkill 清理（agy 另測 `--conversation`/`--json-schema` 是否�
 - agy 只以模擬事件測試（見上）；權限拒絕偵測僅辨識明確的政策/核准拒絕字樣，一般 EACCES 等工具錯誤不算。若 `probe.py agy` 結果不符，請貼回輸出調整 `agent/adapters/agy.py`。
 - `writes` 欄位只是告知 Worker 的允許範圍並用於事後比對檔案變動，**無法強制**。
 - 同時有 Manager 與 Worker 在跑時，檔案快照無法區分是誰改的。
-- `timeout` 是每個 turn 的總時間上限（`turn_timeout_sec`），沒有另外的「無輸出」偵測。
+- `timeout` 是每個 turn 的總時間上限（`turn_timeout_sec`）。另有純提示用的「無輸出」提醒（`silence_warn_sec` 預設 60 秒、之後每 `silence_repeat_sec` 預設 300 秒最多一次，有新輸出即重算）；它不會中斷任務，也不代表模型正在「思考」，只表示 CLI 沒有新輸出。
+- 聊天室在等待輸入時若有非同步訊息（開始執行、提醒）插入，終端機的「正在輸入的文字」會暫時被清掉重畫提示列（文字仍在輸入緩衝區，按 Enter 照常送出）。標準函式庫的一般行輸入無法做到完整保留；完整方案（自製行編輯器或 prompt_toolkit）列為後續工作。
+- 啟動時會在背景用官方 `--version` 記錄 CLI 版本（不耗額度、失敗不影響使用）；版本是否「已測試」見 `/status`，清單在 `agent/compat.py`，且不等於完全相容。
 - 中斷後，被中斷的 CLI Session 可能留有半截歷史；程式會告知 Manager「任務被中斷、檔案未還原」。

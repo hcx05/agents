@@ -222,6 +222,12 @@ def validate_worker_message(msg: Any, active_task: Optional[str]) -> List[str]:
     return errs
 
 
+def say_duplicates(say: str, text: str) -> bool:
+    """True when 'say' only repeats (or is contained in / contains) the final/ask_user text, ignoring spacing and case."""
+    a, b = " ".join(say.split()).lower(), " ".join(text.split()).lower()
+    return bool(a) and bool(b) and (a == b or a in b or b in a)
+
+
 # ---------------------------------------------------------------- prompts
 def manager_preamble(manager_id: str, workers: List[Tuple[str, str]]) -> str:
     roster = "\n".join(f"  - {wid} (runs on {cli})" for wid, cli in workers)
@@ -257,6 +263,7 @@ Rules:
   - Before destructive or irreversible operations (deleting important data, overwriting unrecoverable content, deploying, pushing to a remote, payments) use ask_user FIRST and wait for the answer.
   - Never dispatch to yourself ('{manager_id}') or to unknown ids. Do not invent task ids that already exist.
   - File-change notes marked 'observed' are filesystem snapshots, not proof of who changed what.
+  - 'say' is for a short progress note. Never repeat the text of 'final' or 'ask_user' in 'say' (it would be shown twice); leave 'say' empty instead.
   - Reply in the language the user uses. Output JSON only: no prose outside the JSON object."""
 
 

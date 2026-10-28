@@ -55,7 +55,7 @@ class BufferUI(UI):
 
 
 class ChatUI(UI):
-    COLORS = {"Manager": "36", "Me": "1", "system": "33", "error": "31"}
+    COLORS = {"Manager": "36", "Me": "1", "system": "33", "error": "31", "ask": "1;36"}
 
     def __init__(self, out=None) -> None:
         self.out = out or sys.stdout
@@ -71,10 +71,10 @@ class ChatUI(UI):
         code = self.COLORS.get(key, "32")
         return f"\x1b[{code}m{s}\x1b[0m"
 
-    def _emit(self, prefix: str, text: str, key: str) -> None:
+    def _emit(self, prefix: str, text: str, key: str, indent: bool = True) -> None:
         with self.lock:
             lines = text.splitlines() or [""]
-            pad = " " * len(prefix)
+            pad = " " * len(prefix) if indent else ""
             body = "\n".join((prefix if i == 0 else pad) + ln for i, ln in enumerate(lines))
             if self.prompt_shown and self.tty:
                 self.out.write("\r\x1b[2K" if self.color else "\n")
@@ -94,7 +94,8 @@ class ChatUI(UI):
         self._emit("[error] ", text, "error")
 
     def ask_user(self, text: str) -> None:
-        self._emit("Manager> @Me ", text + "\n(reply to answer the Manager's question)", "Manager")
+        # header and question stay in the one timeline; the question starts at the left edge so it is easy to spot
+        self._emit("Manager> @Me ", "[需要你的回答]\n" + text, "ask", indent=False)
 
     def banner(self, lines: List[str]) -> None:
         with self.lock:

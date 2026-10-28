@@ -70,7 +70,9 @@ class TestCliE2E(unittest.TestCase):
         scn = {"manager": [M([ask("可以執行嗎？")]), M([final("好，已執行。")])], "w1": []}
         r = run_agent([], "做危險的事\n可以\n/exit\n", self.env(scn), self.work)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertLess(r.stdout.index("Manager> @Me 可以執行嗎？"), r.stdout.index("Manager> @Me 好，已執行。"))
+        # ask_user is now headed "[需要你的回答]" with the question on its own line (format changed on purpose)
+        self.assertLess(r.stdout.index("Manager> @Me [需要你的回答]\n可以執行嗎？"),
+                        r.stdout.index("Manager> @Me 好，已執行。"))
 
     def test_missing_cli_exits_cleanly(self):
         self.cfg["agents"]["w1"]["command"] = "definitely-not-a-real-cli-xyz"

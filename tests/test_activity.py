@@ -249,3 +249,55 @@ class TestConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSayFinalDedup(Base):
+    def run_one(self, say, action):
+        self.rig = r = Rig({"manager": [M([action], say=say)], "w1": []})
+        r.say("hi")
+        return r
+
+    def test_identical_say_and_final_shown_once(self):
+        r = self.run_one("全部完成。", final("全部完成。"))
+        self.assertEqual(r.chat_lines(), ["Manager> @Me 全部完成。"])
+        self.assertEqual(len(r.events("say_deduplicated")), 1)
+
+    def test_say_contained_in_final_or_final_in_say_shown_once_longest(self):
+        r = self.run_one("完成", final("完成了，結果如下：A、B、C"))
+        self.assertEqual(r.chat_lines(), ["Manager> @Me 完成了，結果如下：A、B、C"])
+        r.close()
+        r = self.run_one("好了。\n結果：A、B、C", final("結果：A、B、C"))
+        self.assertEqual(r.chat_lines(), ["Manager> @Me 好了。\n結果：A、B、C"])
+
+    def test_real_progress_note_is_kept(self):
+        r = self.run_one("我先檢查專案結構。", final("結構很簡單，共 3 個檔案。"))
+        self.assertEqual(r.chat_lines(), ["Manager> 我先檢查專案結構。", "Manager> @Me 結構很簡單，共 3 個檔案。"])
+        self.assertEqual(r.events("say_deduplicated"), [])
+
+    def test_progress_say_with_dispatch_is_untouched(self):
+        self.rig = r = Rig({"manager": [M([dispatch("w1", "t1", "分析程式")], say="分析程式"), M([final("好")])],
+                            "w1": [W("done", "t1", "完成")]})
+        r.say("go")
+        self.assertEqual(r.chat_lines()[:2], ["Manager> 分析程式", "Manager> @w1 分析程式"])   # dispatch is not deduplicated
+
+    def test_ask_user_say_duplicate_shown_once(self):
+        r = self.run_one("可以刪除 build 嗎？", ask("可以刪除 build 嗎？"))
+        self.assertEqual(r.ui.texts("ask_user"), ["可以刪除 build 嗎？"])
+        self.assertEqual(r.chat_lines(), [])
+        self.assertEqual(r.engine.state, State.WAITING_USER)
+
+    def test_prompt_tells_manager_not_to_repeat(self):
+        from agent import protocol
+        self.assertIn("Never repeat the text of 'final'", protocol.manager_preamble("manager", [("w1", "agy")]))
+
+
+class TestAskUserDisplay(unittest.TestCase):
+    def test_ask_user_is_headed_and_in_the_same_timeline(self):
+        import io
+        from agent.ui import ChatUI
+        out = io.StringIO()
+        ui = ChatUI(out)
+        ui.chat("Me", "清理專案")
+        ui.ask_user("可以刪除 build 資料夾嗎？")
+        ui.chat("Me", "可以")
+        self.assertEqual(out.getvalue(), "Me> 清理專案\nManager> @Me [需要你的回答]\n可以刪除 build 資料夾嗎？\nMe> 可以\n")
