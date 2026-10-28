@@ -69,6 +69,7 @@ class ClaudeParser(Parser):
         self.json_lines = 0
         self.unknown_types: Dict[str, int] = {}      # unfamiliar event types: ignored, but reported
         self.tool_denial_texts: List[str] = []
+        self.compacted = False                       # documented `system/compact_boundary` event seen this turn
 
     def feed(self, stream: str, line: str) -> None:
         if stream == "stderr":
@@ -154,6 +155,8 @@ class ClaudeParser(Parser):
             caps = ev.get("capabilities")
             if isinstance(caps, list):
                 self.cli_meta["capabilities"] = [c for c in caps if isinstance(c, str)][:20]
+        elif sub == "compact_boundary":
+            self.compacted = True
         elif sub == "api_retry" and isinstance(ev.get("error"), str):
             self.retry_errors.append(ev["error"])
 

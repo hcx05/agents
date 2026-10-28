@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from . import __version__
+from . import __version__, importer
 from .adapters import get_adapter
 from .config import ConfigError, config_path, ensure_config, home_dir, load_config
 from .orchestrator import Engine
@@ -20,6 +20,14 @@ from .ui import ChatUI, RecordingUI
 HELP_IN_CHAT = "Commands: /status  /interrupt  /exit.  Anything else is sent to the Manager."
 HELP_RESUMED = ("Commands: /status  /continue  /interrupt  /exit.  /continue starts the work that was kept on hold; "
                 "typing a message does too.")
+
+
+IMPORT_BOUNDARY = ("── 已匯入 Claude Session {src} ──\n"
+                   "Fork 副本 ID：{fork}（預先保存；副本於第一則訊息時才建立）。\n"
+                   "匯入前的原生對話不在本聊天室紀錄中，可用 `claude --resume {src}` 在原生 Claude 查看；"
+                   "以下只記錄匯入之後的 Agent 團隊對話。")
+IMPORT_REPLAY_NOTE = ("匯入前的 Claude 原生歷史（Session {src}）：未顯示，也不在此紀錄中。"
+                      "以下是匯入之後的 Agent 聊天室紀錄。")
 
 
 def _setup_stdio() -> None:
@@ -75,10 +83,48 @@ def cmd_sessions(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    if importer.is_claude_id(args.session_id):
+        print(f"{args.session_id} is a Claude session id, not an Agent session id.\n"
+              f"  To import it:        agent {args.session_id}\n"
+              "  To continue an Agent session: agent resume <id>   (ids are listed by `agent sessions`)", file=sys.stderr)
+        return 2
     return _run_chat(args, args.session_id)
 
 
-def _run_chat(args: argparse.Namespace, resume_id: Optional[str]) -> int:
+def cmd_import(args: argparse.Namespace) -> int:
+    return _run_chat(args, None, import_id=args.claude_session_id)
+
+
+def _confirm_import(pf: "importer.Preflight", args: argparse.Namespace) -> bool:
+    """Show what an import does and get an explicit yes. Nothing has been created and no model has been called yet.
+    A folder that merely LOOKS different (a guess) needs its own explicit yes: --here, or a second answer."""
+    print(importer.confirmation_text(pf))
+    yes, here = getattr(args, "yes", False), getattr(args, "here", False)
+    if not sys.stdin.isatty():
+        if not yes:
+            print("Not a terminal: add --yes to confirm the import.", file=sys.stderr)
+            return False
+        if pf.folder_mismatch and not here:
+            print("The folder looks different from the one the session was created in (a guess). "
+                  "Add --here to import it anyway, or `cd` to the original folder.", file=sys.stderr)
+            return False
+        return True
+    if not yes and not _ask_yes("確定匯入嗎？"):
+        return False
+    if pf.folder_mismatch and not here:
+        return _ask_yes("資料夾疑似不同（推測）。仍要在目前資料夾匯入嗎？")
+    return True
+
+
+def _ask_yes(question: str) -> bool:
+    try:
+        return input(f"{question} 輸入 yes 繼續：").strip().lower() in ("yes", "y")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Optional[str] = None) -> int:
     resume_dir: Optional[Path] = None
     if resume_id is not None:
         try:
@@ -112,6 +158,16 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str]) -> int:
 
     root = home_dir() / "sessions"
     resumed = resume_id is not None
+    imp_state = None
+    if import_id is not None:
+        pf = importer.preflight(import_id, cwd, root, cfg.agents[cfg.manager].cli)
+        if pf.blockers:
+            print("Cannot import:\n" + "\n".join("  - " + b for b in pf.blockers), file=sys.stderr)
+            return 2
+        if not _confirm_import(pf, args):
+            print("Import cancelled. Nothing was created and the model was not called.")
+            return 1
+        imp_state = importer.new_import_state(import_id)
     if resumed:
         lock = SessionLock(resume_dir)
         try:
@@ -139,6 +195,8 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str]) -> int:
             print(f"Cannot start: {e}", file=sys.stderr)
             return 2
         warns = []
+        if imp_state is not None:
+            store.update(**{"import": imp_state})          # the fork id is on disk before anything else happens
     plain = ChatUI()
     ui = RecordingUI(plain, store)
     try:
@@ -152,8 +210,14 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str]) -> int:
                f"Manager: {adapters[mgr.id].display_name}" + (f" ({mgr.model})" if mgr.model else ""),
                *[f"Worker: {adapters[w.id].display_name} [{w.id}]" + (f" ({w.model})" if w.model else "")
                  for w in cfg.workers],
+               *([f"Imported Claude session: {store.state['import']['source_id']}  (copy: {store.state['import']['fork_id']})"]
+                 if store.state.get("import") else []),
                f"Folder: {cwd}", f"Session log: {store.dir}", HELP_RESUMED if resumed else HELP_IN_CHAT])
+    if imp_state is not None:
+        ui.system(IMPORT_BOUNDARY.format(src=imp_state["source_id"], fork=imp_state["fork_id"]))
     if resumed:
+        if store.state.get("import"):
+            plain.system(IMPORT_REPLAY_NOTE.format(src=store.state["import"]["source_id"]))
         shown = replay(plain, timeline(Store.read_events(store.dir)), getattr(args, "replay", 60))
         for w in warns:
             ui.system("注意：" + w)
@@ -211,15 +275,54 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--replay", type=int, default=60, help="show the last N earlier chat items first (0 = none)")
     r.add_argument("--here", action="store_true", help="continue even though the current folder differs from the saved one")
     r.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    i = sub.add_parser("import", help="import a native Claude Code session (also: agent <Claude Session UUID>): "
+                                      "the Manager continues a COPY of it; the original is never modified")
+    i.add_argument("claude_session_id", help="the Claude Code session id (UUID)")
+    i.add_argument("--yes", action="store_true", help="confirm the import without the interactive question")
+    i.add_argument("--here", action="store_true",
+                   help="import even though the session seems to come from another folder (a guess from Claude's storage)")
+    i.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     c = sub.add_parser("config", help="create the config file if missing and show its path")
     c.add_argument("--show", action="store_true", help="also print the file contents")
     c.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     return p
 
 
+COMMANDS = ("sessions", "resume", "import", "config")
+
+
+def rewrite_argv(argv: List[str]) -> Optional[List[str]]:
+    """`agent <Claude Session UUID>` means `agent import <uuid>`. Returns None (after printing why) when the first word is an
+    Agent session id, which needs `resume`. Everything else is left exactly as typed."""
+    i = 0
+    while i < len(argv):
+        t = argv[i]
+        if t == "--config":
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        if t in COMMANDS:
+            return argv
+        if importer.is_claude_id(t):
+            return argv[:i] + ["import"] + argv[i:]
+        if importer.AGENT_ID_RE.match(t):
+            print(f"{t} looks like an Agent session id. Continue it with:  agent resume {t}", file=sys.stderr)
+            return None
+        return argv
+    return argv
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     _setup_stdio()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = rewrite_argv(argv)
+    if argv is None:
+        return 2
     args = build_parser().parse_args(argv)
+    if args.command == "import":
+        return cmd_import(args)
     if args.command == "config":
         return cmd_config(args)
     if args.command == "sessions":

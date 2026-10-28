@@ -10,7 +10,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-STATE_VERSION = 2
+# 1: first resumable layout; 2: + config/cwd/mail/preamble_sent; 3: + `import` (native Claude session import, with its own
+# restore rules). Older versions load and are upgraded in memory; a program that only knows an older version refuses v3.
+STATE_VERSION = 3
 RAW_LINE_MAX = 2000
 RAW_FILE_MAX = 2 * 1024 * 1024
 
@@ -203,12 +205,15 @@ class Store:
         for sid in Store.list_sessions(sessions_root):
             d = Path(sessions_root) / sid
             row: Dict[str, Any] = {"id": sid, "ok": True, "version": None, "updated": None, "cwd": None, "state": None,
-                                   "agents": "", "locked": False, "first": ""}
+                                   "agents": "", "locked": False, "first": "", "import_source": None}
             try:
                 st = json.loads((d / "state.json").read_text(encoding="utf-8"))
                 row.update(version=st.get("version", 1), updated=st.get("updated") or st.get("created"),
                            cwd=st.get("cwd"), state=st.get("state"),
                            agents="+".join(str(a.get("cli", "?")) for a in (st.get("agents") or {}).values()))
+                imp = st.get("import")
+                if isinstance(imp, dict) and isinstance(imp.get("source_id"), str):
+                    row["import_source"] = imp["source_id"]
             except (OSError, ValueError, AttributeError):
                 row["ok"] = False
             row["locked"] = SessionLock.is_locked(d)

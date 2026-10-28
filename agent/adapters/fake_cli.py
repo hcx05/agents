@@ -8,7 +8,8 @@ Step keys: reply(obj) | text(str) | sleep(sec) | exit(code) | stderr(str) | raw_
            write_file({path,content}) | is_error(str) | forget_sessions_of(agent id) | wait_for_file(path relative to cwd) |
            report_model(str: init.model) | omit_model(bool) | assistant_model(str) | api_retry_error(str) |
            fork_keeps_id(bool: --fork-session "forgets" to create a new session) |
-           fork_ignores_session_id(bool: --fork-session ignores the requested --session-id and picks a random id)
+           fork_ignores_session_id(bool: --fork-session ignores the requested --session-id and picks a random id) |
+           compact(bool: emit a system/compact_boundary event, as after an automatic compaction)
 Like the real CLI (2.1.312): --session-id with --resume needs --fork-session, and an id that already exists is refused
 ("Error: Session ID X is already in use.", exit 1, before any scenario step is consumed).
 """
@@ -115,6 +116,9 @@ def main():
     if not pstep.get("omit_model"):
         init["model"] = pstep.get("report_model") or opts["model"] or "fake-default"
     out(init)
+    if pstep.get("compact"):
+        out({"type": "system", "subtype": "compact_boundary", "session_id": sid,
+             "compact_metadata": {"trigger": "auto", "pre_tokens": 1}})
     if pstep.get("api_retry_error"):
         out({"type": "system", "subtype": "api_retry", "session_id": sid, "attempt": 1, "max_retries": 3,
              "retry_delay_ms": 10, "error_status": 401, "error": pstep["api_retry_error"]})

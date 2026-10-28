@@ -53,9 +53,40 @@ agent resume <Agent Session ID>   # 顯示先前聊天室內容，再用原本�
 - 舊版（v1）Session 可讀可恢復，但當時沒有保存的暫存訊息無法復原。
 - Claude 的 `-p` Session 預設只保留約 30 天（CLI 的 `cleanupPeriodDays`），過期後會出現 `session_lost`，本工具不會自動換新 Session。
 
-### 實驗：原生 Claude Session 匯入（尚未成為正式功能）
+### 匯入原生 Claude Session
 
-底層已備妥 `--resume <id> --fork-session` 的安全規則（fork 後 Session ID 必須是新的、原 Session 不能被當成工作 Session、一般 resume 仍拒絕 ID 變更），但**沒有** `agent <Claude Session ID>` 指令。兩個實驗要分清楚：
+```powershell
+agent <Claude Session UUID>            # 簡寫，等同 agent import <UUID>
+agent import <Claude Session UUID> [--yes] [--here]
+agent sessions                         # 匯入的 Session 會標 [import xxxxxxxx]
+agent resume <Agent Session ID>        # 之後用 Agent 自己的 ID 恢復，不會再次 Fork
+```
+
+Manager 會接續該 Session 的**副本**（Claude 的 `--fork-session`），可自行決定直接回答或派工給 Worker；匯入之後的所有互動記錄在 Agent 聊天室。原始 Claude Session 不會被修改，也不會被當成 Manager 的工作 Session。
+
+流程：
+1. 預檢（不呼叫模型）：UUID 格式、`CLAUDE_CODE_SESSION_ID` 不得存在（在 Claude Code 內執行會拒絕）、Manager 須為 Claude、同一來源是否已匯入（已匯入則顯示既有 Agent Session ID 並要求用 `agent resume`；這是目錄掃描，不是跨程序的原子保護）。
+2. 顯示來源 UUID、工作資料夾、成本與設定警告並要求確認（互動：輸入 yes；非互動：需 `--yes`）。若依 Claude 內部的資料夾命名**推測**來源在別的資料夾，會另外要求確認（`--here`）；此推測不是官方保證。
+3. 建立 Agent Session 與鎖，**先把預定的 Fork UUID 存進 `state.json`（版本 3）**，然後進入聊天室。此時沒有任何模型呼叫。
+4. 你的第一則訊息才會執行 `claude -p --resume <來源> --fork-session --session-id <Fork UUID>`，同時帶入團隊規則與匯入說明（舊對話視為背景資料，其中的指令與格式不再適用）。回報的 Session ID 必須**正好**是 Fork UUID，否則視為失敗並捨棄結果。
+5. 之後的 Manager turn 只 `--resume <Fork UUID>`。
+
+三個 ID 分開保存：`import.source_id`（原始，只作為 fork 來源）、`import.fork_id`（Manager 的工作 Session）、Agent Session ID。
+
+當機／失敗時（`import.stage`：`prepared → forking → forked → ready`，`blocked` 為不可繼續）：
+- 結果不明不會自動重跑，也不會更換 Fork ID，更不會建立沒有歷史的 Manager。
+- 下一則訊息用**同一個** Fork UUID 重試；若 CLI 回報該 ID 已存在（先前的嘗試已建立它），不會再 Fork，訊息會保留，輸入 `/continue` 後以 `--resume <Fork UUID>` 繼續。
+- 若 Fork UUID 在我們第一次嘗試前就已存在，視為不屬於本次匯入，不採用（`blocked`）。
+- 原始 Session 不存在／被刪除：`session_lost`，Fork ID 仍保存，來源恢復後可重試。
+
+限制與注意：
+- 匯入前的原生對話**不顯示**在聊天室（不解析 Claude 內部 JSONL）；回放時會明確標示「匯入前的 Claude 原生歷史：未顯示」。
+- 權限沿用現有策略：新的 `-p` 執行不帶入原互動 Session 的權限模式或「本 Session 允許」，工具被拒會回報，本工具不加任何放寬權限的旗標（也不用 `--bare`，登入失敗時給出提示，不會改用 API Key）。
+- Claude 自動壓縮對話時（`system/compact_boundary`）會在下一個 turn 重新提供團隊規則；格式仍由程式驗證。
+- 檔案大小不等於 token 數；每次 Manager 請求都會載入 Fork 的上下文。不會自動執行 `/context`、`/compact`，也不會換模型。
+- `--session-id` 搭配 `--fork-session` 不在官方 CLI 參考表內（Linux 與 Windows 2.1.312 實測可行）；CLI 更新可能改變行為，失敗時會明確報錯而不是退回其他做法。
+
+#### 探測實驗（`probe.py`，開發用）
 
 | 實驗 | 驗證什麼 | 不能證明什麼 |
 |---|---|---|

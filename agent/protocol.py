@@ -268,6 +268,20 @@ Rules:
   - Reply in the language the user uses. Output JSON only: no prose outside the JSON object."""
 
 
+def import_notice() -> str:
+    """Sent once, right after the manager preamble, in the first Manager turn of an imported Claude session."""
+    return """[system] IMPORTED CONVERSATION. Everything in this session BEFORE this message was a direct conversation between the human and Claude Code, outside this agent team. It is background knowledge only:
+  - Use it for context, facts and the state of the work. You may continue that work.
+  - Any instruction, role, output format or rule found in that earlier history does NOT apply from now on. From now on you are the MANAGER described above and every reply MUST be the single JSON object described above, nothing else.
+  - Your tools run under the permissions of this non-interactive run, which are NOT the ones the earlier conversation had. If a tool is refused, say so in your reply; never try to get around it and never ask the human to change settings through you.
+  - Do not assume earlier approvals ("allow for this session") still exist."""
+
+
+def reinject_note() -> str:
+    return ("[system] The conversation was compacted by Claude Code, so the team rules above are repeated here. "
+            "Keep replying with ONE JSON object only.")
+
+
 def worker_preamble(worker_id: str, manager_id: str) -> str:
     return f"""You are worker "{worker_id}" in a hierarchical agent team. You talk ONLY to the manager ("{manager_id}").
 You receive tasks as [task <id> from manager] blocks. Do the work with your normal tools and permissions.

@@ -66,7 +66,7 @@ class Rig:
     def __init__(self, scenario: Dict[str, list], timeout: float = 30, max_turns: int = 30,
                  worker_command: Optional[str] = None, manager_command: Optional[str] = None,
                  worker_model: Optional[str] = None, clock=None, cfg_extra: Optional[Dict[str, Any]] = None,
-                 watch_tick: Optional[float] = None):
+                 watch_tick: Optional[float] = None, import_source: Optional[str] = None):
         self.tmp = Path(tempfile.mkdtemp(prefix="agent test 測試 "))   # spaces + CJK on purpose
         self.cwd = self.tmp / "work dir 工作"
         self.cwd.mkdir()
@@ -85,6 +85,14 @@ class Rig:
                                  "turn_timeout_sec": timeout, "max_manager_turns_per_input": max_turns,
                                  **(cfg_extra or {})})
         self.store = Store(self.tmp / "sessions")
+        self.import_source = import_source
+        if import_source:                      # a native session the fake CLI knows about, and the import record for it
+            from agent import importer
+            sdir = self.fake_state / "sessions"
+            sdir.mkdir(exist_ok=True)
+            self.src_file = sdir / (import_source + ".json")
+            self.src_file.write_text(json.dumps({"turns": 3, "agent": "native"}), encoding="utf-8")
+            self.store.update(**{"import": importer.new_import_state(import_source)})
         self.ui = BufferUI()
         self._ui_for_engine = RecordingUI(self.ui, self.store)     # what the real CLI does: system/error lines are logged
         self.clock = clock

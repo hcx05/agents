@@ -49,6 +49,7 @@ class TurnResult:
     model_reported: Optional[str] = None             # model the CLI itself said it used in THIS turn (None = not reported)
     models_all: List[str] = field(default_factory=list)   # every distinct model id the CLI reported this turn
     meta: Dict[str, Any] = field(default_factory=dict)    # optional CLI metadata (version, auth source...), never required
+    compacted: bool = False                          # the CLI said it compacted the conversation during this turn
 
 
 class Parser:
@@ -143,6 +144,7 @@ class Adapter:
         res.model_reported = rep.get("model")
         res.models_all = list(rep.get("models") or [])
         res.meta = dict(rep.get("meta") or {})
+        res.compacted = bool(getattr(parser, "compacted", False))
         res.exit_code = proc.exit_code
         if proc.status == "timeout":
             res.ok, res.error_kind = False, "timeout"

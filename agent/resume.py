@@ -46,6 +46,13 @@ def check_compat(cfg: Config, state: Dict[str, Any], cwd: str, here: bool = Fals
     for aid in cfg.agents:
         if saved and aid not in saved:
             errors.append(f"agent {aid!r} exists in the current config but not in the saved session")
+    if "import" in state:
+        from . import importer
+        mgr = (state.get("agents") or {}).get(cfg.manager) if isinstance(state.get("agents"), dict) else None
+        sid = mgr.get("session_id") if isinstance(mgr, dict) else None
+        errors += ["imported session: " + p for p in importer.validate_import_state(state["import"], sid)]
+        if cfg.agents[cfg.manager].cli not in importer.FORK_CAPABLE:
+            errors.append("imported session: the Manager must run on claude (the imported conversation is a Claude session)")
     old = state.get("cwd")
     if old and _norm(old) != _norm(cwd):
         msg = f"the session was started in {old!r}, you are in {cwd!r}"
@@ -102,7 +109,8 @@ def format_sessions(rows: List[Dict[str, Any]], limit: int = 20) -> str:
     for r in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["updated"])) if r.get("updated") else "?"
         flags = ("" if r["ok"] else " [state.json unreadable]") + (" [IN USE]" if r["locked"] else "") \
-            + (" [v1]" if r.get("version") == 1 else "")
+            + (" [v1]" if r.get("version") == 1 else "") \
+            + (f" [import {r['import_source'][:8]}]" if r.get("import_source") else "")
         first = f"  \"{r['first']}\"" if r.get("first") else ""
         out.append(f"{r['id']:<28} {when:<16} {str(r.get('state') or '?'):<16} {r.get('agents') or '?':<12} "
                    f"{r.get('cwd') or '?'}{first}{flags}")

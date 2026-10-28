@@ -11,12 +11,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from . import compat, protocol, runner
+from . import compat, importer, protocol, runner
 from .adapters import get_adapter
 from .adapters.base import Adapter, TurnRequest, TurnResult
 from .config import AgentCfg, Config
 from .snapshot import FileDiff, diff_snapshots, take_snapshot
-from .store import Store, redact
+from .store import STATE_VERSION, Store, redact
 from .ui import UI
 
 
@@ -69,6 +69,7 @@ class Running:
     req_model: Optional[str] = None     # model WE asked the CLI for in this turn (not necessarily what ran)
     req_effort: Optional[str] = None
     turn_id: str = ""
+    sent_pre: bool = False       # this turn's prompt carried the team preamble
 
 
 @dataclass
@@ -80,6 +81,7 @@ class AgentRT:
     inbox: List[Dict[str, Any]] = field(default_factory=list)
     running: Optional[Running] = None
     preamble_sent: bool = False
+    reinject: bool = False         # the CLI compacted the conversation: repeat the preamble in the next turn
     repair_used: bool = False
     active_task: Optional[str] = None
     turns: int = 0
@@ -137,7 +139,8 @@ ERROR_HINTS = {
     "session_lost": "該 Session 已不存在或與要求的不一致（可能超過 CLI 保留期限、被刪除，或 CLI 改用了別的 Session）；"
                     "本工具不會自動改用新 Session，也不會覆寫已保存的 Session ID",
     "session_busy": "該 Claude Session 正在背景或另一個程序中執行；請先在原生 Claude 結束或 attach 它，本工具不會強行寫入同一個 Session",
-    "fork_failed": "Fork 沒有產生新的 Session，結果已捨棄，原 Session 未被使用",
+    "fork_failed": "Fork 沒有取得預定的 Fork ID，結果已捨棄，原 Session 未被使用",
+    "fork_exists": "Claude CLI 拒絕建立這個 Fork ID（已存在）；本工具不會換用其他 ID",
 }
 
 
@@ -190,7 +193,13 @@ class Engine:
         self._cur_turn: Optional[Dict[str, Any]] = None
         self._model_seen: Dict[str, str] = {}
         self._persisted = ""
-        store.update(cwd=cwd, version=2,
+        imp = store.state.get("import")
+        self.imp: Optional[Dict[str, Any]] = imp if isinstance(imp, dict) else None   # same object as in state.json
+        if self.imp is not None:
+            problems = importer.validate_import_state(self.imp)
+            if problems:
+                raise ValueError("damaged import record: " + "; ".join(problems))
+        store.update(cwd=cwd, version=STATE_VERSION,
                      config={"manager": cfg.manager,
                              "agents": {aid: {"role": a.role, "cli": a.cfg.cli, "model": a.cfg.model,
                                               "effort": a.cfg.effort} for aid, a in self.agents.items()}})
@@ -243,6 +252,7 @@ class Engine:
                     ok_turns = self._agents_with_ok_turn()
                 a.preamble_sent = bool(a.session_id) and aid in ok_turns
             a.turns = info["turns"] if isinstance(info.get("turns"), int) else 0
+            a.reinject = bool(info.get("reinject"))
             if isinstance(info.get("last_model"), str):
                 self._model_seen[aid] = info["last_model"]
             if isinstance(info.get("last_turn"), dict):
@@ -262,6 +272,8 @@ class Engine:
         if legacy:
             rep.append(("system", "這是舊版（v1）Session：排隊中的暫存訊息當時沒有保存，無法恢復；"
                                   "preamble 狀態由事件紀錄推測。"))
+        if self.imp is not None:
+            self._restore_import(rep)
         # 1. turns that were running when the old process ended
         lost = [_mail_text(m) for m in self.mgr.inflight if m["kind"] in ("user", "user_answer")]
         if self.mgr.inflight:
@@ -320,6 +332,32 @@ class Engine:
         self.store.log("session_restored", legacy=legacy, hold=self.hold, interrupted=broken, lost_user=lost,
                        awaiting=bool(self.awaiting_user))
         self._persist()
+
+    def _restore_import(self, rep: List[Tuple[str, str]]) -> None:
+        """The imported Manager works in the fork only. Its session id comes from the import record, never from anything
+        else, and the original id is never touched. Nothing is re-run and no id is replaced here."""
+        imp = self.imp
+        assert imp is not None
+        problems = importer.validate_import_state(imp, self.mgr.session_id)
+        if problems:
+            raise ValueError("; ".join(problems))
+        stage, src, fork = imp["stage"], imp["source_id"], imp["fork_id"]
+        if stage == "ready":
+            self.mgr.session_id = fork
+        else:
+            self.mgr.session_id, self.mgr.preamble_sent = None, False
+        if stage == "prepared":
+            rep.append(("system", f"這是匯入的 Claude Session {src}：尚未 Fork（Fork ID {fork} 已保存）。第一則訊息才會建立 Fork。"))
+        elif stage == "forking":
+            rep.append(("system", f"匯入的 Claude Session {src}：上次 Fork 的結果不明（Fork {fork} 可能已建立）。"
+                                  "Fork ID 不會更換、也不會自動重做；你的下一則訊息會用同一個 ID 重試。"
+                                  "若 CLI 回報該 ID 已存在，會保留訊息並改以 --resume 該 Fork 繼續（需要 /continue）。"))
+        elif stage == "forked":
+            rep.append(("system", f"匯入的 Claude Session {src}：Fork {fork} 已存在，但 Manager 尚未成功回覆過。"
+                                  "下一次會直接 --resume 這個 Fork（不會再 Fork）。"))
+        elif stage == "blocked":
+            rep.append(("system", f"匯入的 Claude Session {src} 無法安全繼續（Fork {fork} 在從未嘗試過之前就已存在）。"
+                                  "請用 `agent import` 重新匯入。"))
 
     def _settle_restore(self) -> None:
         """Pick the starting state from what was restored (the normal transition table starts at idle)."""
@@ -422,6 +460,9 @@ class Engine:
                 lines.append(f"  {a.id} ({a.role}, {a.cfg.cli}) {self._activity(a)}{task}, queued={len(a.inbox)}, "
                              f"model={a.cfg.model or 'default'}, effort={a.cfg.effort or 'default'}, "
                              f"session={a.session_id or '-'}{last}")
+            if self.imp:
+                lines.append(f"  imported Claude session: source={self.imp['source_id']} (never resumed), "
+                             f"fork={self.imp['fork_id']}, stage={self.imp['stage']}, fork attempts={self.imp.get('attempts', 0)}")
             if self.hold:
                 n = sum(len(a.inbox) for a in self.agents.values())
                 lines.append(f"  on hold after resume: {n} queued item(s). /continue processes them, "
@@ -694,8 +735,14 @@ class Engine:
         return "[system] team status -> " + "; ".join(parts) + f"; {used}"
 
     def _start_turn(self, a: AgentRT) -> None:
-        mails, a.inbox = a.inbox, []
         task: Optional[Dict[str, Any]] = None
+        if a is self.mgr and self.imp and self.imp["stage"] == "blocked":
+            self.ui.error("匯入無法安全繼續（Fork ID 在從未嘗試前就已存在）。這個 Session 不會建立空白 Manager；請用 `agent import` 重新匯入。")
+            self._go(State.FAILED)
+            self._abort_workflow("the imported session is blocked")
+            return
+        mails, a.inbox = a.inbox, []
+        route: Tuple[Optional[str], bool, Optional[str]] = (None, False, None)
         if a.role == "manager":
             if self.manager_turns >= self.cfg.max_manager_turns_per_input:
                 self.ui.error(f"Manager turn limit ({self.cfg.max_manager_turns_per_input}) reached for this input.")
@@ -706,6 +753,11 @@ class Engine:
             body = protocol.fmt_mail(mails) + "\n\n" + self._team_status_line()
             schema = protocol.MANAGER_SCHEMA
             pre = protocol.manager_preamble(a.id, [(w, self.agents[w].cfg.cli) for w in self.worker_ids])
+            if self.imp and not a.preamble_sent:
+                pre += "\n\n" + protocol.import_notice()
+            elif a.reinject:
+                pre += "\n\n" + protocol.reinject_note()
+            route = self._manager_route(a)
         else:
             for m in mails:
                 if m["kind"] in ("task", "answer"):
@@ -716,16 +768,31 @@ class Engine:
             body = protocol.fmt_mail(mails)
             schema = protocol.WORKER_SCHEMA
             pre = protocol.worker_preamble(a.id, self.mgr.id)
-        prompt = (pre + "\n\n---\n" + body) if not a.preamble_sent else body
+            if a.reinject:
+                pre += "\n\n" + protocol.reinject_note()
+        send_pre = (not a.preamble_sent) or a.reinject
+        prompt = (pre + "\n\n---\n" + body) if send_pre else body
 
-        sid = a.session_id if a.preamble_sent else None
-        if a.session_id and not a.preamble_sent:
-            self.ui.system(f"{a.id}: earlier first turn never succeeded; starting a fresh CLI session.")
-            self.store.log("session_reset", agent=a.id, old=a.session_id)
+        if self.imp and a is self.mgr:
+            sid, fork, new_id = route                  # an imported Manager NEVER takes the "start a fresh session" path
+        else:
+            sid, fork, new_id = (a.session_id if a.preamble_sent else None), False, None
+            if a.session_id and not a.preamble_sent:
+                self.ui.system(f"{a.id}: earlier first turn never succeeded; starting a fresh CLI session.")
+                self.store.log("session_reset", agent=a.id, old=a.session_id)
+        if self.imp and sid == self.imp["source_id"] and not fork:
+            raise RuntimeError("refusing to resume the ORIGINAL Claude session; only the fork may be resumed")
+        if fork:                                       # persisted BEFORE the CLI is started: a crash cannot lose the fork id
+            self.imp["stage"] = "forking"
+            self.imp["attempts"] = self.imp.get("attempts", 0) + 1
+            self.imp["last_attempt"] = time.time()
+            self.store.save()
+            self.store.log("import_fork_start", source=sid, fork=new_id, attempt=self.imp["attempts"])
         model = (task or {}).get("model") or a.cfg.model
         effort = (task or {}).get("effort") or a.cfg.effort
         req = TurnRequest(agent_id=a.id, prompt=prompt, cwd=self.cwd, session_id=sid, model=model,
-                          effort=effort, schema=schema, timeout=self.cfg.turn_timeout_sec)
+                          effort=effort, schema=schema, timeout=self.cfg.turn_timeout_sec, fork=fork,
+                          new_session_id=new_id)
         cancel = threading.Event()
         epoch = self.epoch
         th = threading.Thread(target=self._turn_thread, args=(a, req, cancel, epoch), daemon=True,
@@ -735,12 +802,21 @@ class Engine:
         a.turns += 1
         a.inflight = list(mails)
         a.running = Running(th, cancel, epoch, t0=t0, last_output=t0, req_model=model, req_effort=effort,
-                            turn_id=f"{a.id}#{a.turns}")
+                            turn_id=f"{a.id}#{a.turns}", sent_pre=send_pre)
         self.store.log("turn_start", agent=a.id, epoch=epoch, session=sid, model=model, effort=effort,
                        turn=f"{a.id}#{a.turns}",
-                       prompt_chars=len(prompt), resumed=sid is not None)
+                       prompt_chars=len(prompt), resumed=sid is not None, fork=fork, fork_id=new_id)
         self._announce_start(a, kinds)
         th.start()
+
+    def _manager_route(self, a: AgentRT) -> Tuple[Optional[str], bool, Optional[str]]:
+        """(session to resume, fork it?, id the fork must get). The original Claude session is only ever the source of
+        the one fork request; every other Manager turn resumes the fork."""
+        if self.imp is None:
+            return (a.session_id if a.preamble_sent else None), False, None
+        if self.imp["stage"] in ("prepared", "forking"):
+            return self.imp["source_id"], True, self.imp["fork_id"]
+        return self.imp["fork_id"], False, None
 
     def _announce_start(self, a: AgentRT, kinds: Set[str]) -> None:
         """One short timeline line when a turn starts; a pure format-repair retry stays quiet (the rejection already said so)."""
@@ -789,8 +865,12 @@ class Engine:
             return  # belongs to work that was interrupted/aborted
         a = self.agents[d.agent_id]
         run, a.running = a.running, None
-        a.inflight = []
+        mails, a.inflight = a.inflight, []
         res = d.res
+        if res.ok and a is self.mgr and self.imp and res.session_id != self.imp["fork_id"]:
+            res = TurnResult(False, session_id=None, error_kind="fork_failed", denials=res.denials,
+                             error=f"the Manager answered in session {res.session_id!r}, not in the saved fork "
+                                   f"{self.imp['fork_id']}; the result was discarded")
         info = turn_info(a, run.turn_id if run else f"{a.id}#{a.turns}", run.req_model if run else None,
                          run.req_effort if run else None, res)
         a.last_turn = info
@@ -800,9 +880,23 @@ class Engine:
                        denials=res.denials, files=d.diff.to_dict() if d.diff else None, turn=info, cli_meta=res.meta)
         if res.ok:
             a.preamble_sent = True
-        self.store.set_agent(a.id, preamble_sent=a.preamble_sent, turns=a.turns, last_turn=info,
+            if run is not None and run.sent_pre:
+                a.reinject = False
+            if res.compacted:
+                a.reinject = True
+                self.store.log("compaction", agent=a.id)
+                self.ui.system(f"{self._display(a)} 的對話剛被 Claude 自動壓縮；下一個 turn 會重新提供團隊規則。")
+            if a is self.mgr and self.imp:
+                if self.imp["stage"] != "ready":
+                    self.store.log("import_ready", fork=self.imp["fork_id"])
+                self.imp["stage"] = "ready"
+                a.session_id = self.imp["fork_id"]
+                self.store.set_agent(a.id, session_id=a.session_id)
+        self.store.set_agent(a.id, preamble_sent=a.preamble_sent, reinject=a.reinject, turns=a.turns, last_turn=info,
                              **({"cli_meta": res.meta} if res.meta else {}))
         if not res.ok:
+            if self._import_fork_exists(a, res, mails):
+                return
             self._on_agent_error(a, res)
             return
         obj, perr = protocol.extract_json(res.text)
@@ -823,6 +917,28 @@ class Engine:
             self._apply_manager(obj)
         else:
             self._apply_worker(a, obj, d)
+
+    def _import_fork_exists(self, a: AgentRT, res: TurnResult, mails: List[Dict[str, Any]]) -> bool:
+        """The CLI refused our fork id as "already in use". After an earlier attempt of ours that is expected (the
+        crashed/cancelled attempt did create it): keep the id, do not fork again, hold the message for /continue. On a
+        first attempt it means the id existed before we ever tried: not ours, never adopted."""
+        imp = self.imp
+        if a is not self.mgr or imp is None or res.error_kind != "fork_exists" or imp["stage"] != "forking":
+            return False
+        if imp.get("attempts", 0) >= 2:
+            imp["stage"] = "forked"
+            self.store.save()
+            self.mgr.inbox[0:0] = mails
+            self.manager_turns = max(0, self.manager_turns - 1)
+            self.hold = True
+            self.store.log("import_fork_exists", fork=imp["fork_id"])
+            self.ui.system(f"Fork {imp['fork_id']} 已存在（先前的嘗試已建立它）。不會再 Fork，也不會換用其他 ID。"
+                           "你的訊息已保留；輸入 /continue 以 --resume 該 Fork 繼續。"
+                           "注意：無法確認該副本是否完整；若之後出現 session_lost，請用 `agent import` 重新匯入。")
+            return True
+        imp["stage"] = "blocked"
+        self.store.save()
+        return False
 
     def _reject(self, a: AgentRT, raw: str, errors: List[str]) -> None:
         self.store.log("rejected", agent=a.id, errors=errors, raw=(raw or "")[:1500])
@@ -865,6 +981,9 @@ class Engine:
         hint = ERROR_HINTS.get(kind)
         if hint:
             res.error = f"{res.error} [{hint}]"
+        if a is self.mgr and self.imp and self.imp["stage"] in ("forking", "forked"):
+            res.error += (f" [匯入：Fork {self.imp['fork_id']} 尚未確認成功。Fork ID 已保存、不會更換，"
+                          "也不會建立沒有歷史的 Manager；你的下一則訊息會用同一個 ID 重試。]")
         if a.role == "worker":
             ev = ""
             status = "timeout" if kind == "timeout" else "failed"
