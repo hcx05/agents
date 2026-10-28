@@ -44,6 +44,14 @@ def sanitize(text: str) -> str:
     return _CTRL.sub("", _ANSI.sub("", text))
 
 
+def one_line(value: Any, limit: int = 40) -> str:
+    """A dynamic value (tool name, task id, agent name ...) as safe single-line status text. prompt_toolkit already
+    shows ESC / BEL / NUL / C1 as inert caret text (^[), but it passes bidi overrides through untouched and starts a new
+    row at a newline, so those are removed here; whitespace is collapsed and the length is capped."""
+    text = " ".join(sanitize("" if value is None else value).split())
+    return clip(text, limit)
+
+
 def text_width(s: str) -> int:
     return sum(get_cwidth(c) for c in s)
 
@@ -133,7 +141,7 @@ class Entry:
         text = sanitize(self.text)
         st = self._style()
         if self.kind in ("chat", "ask"):
-            who = self.sender + (f" -> {self.to}" if self.to else "")
+            who = sanitize(self.sender + (f" -> {self.to}" if self.to else "")).replace("\n", " ")
             head = ([] if self.replay else [time.strftime("%H:%M:%S", time.localtime(self.ts))]) + [who]
             if self.kind == "ask":
                 head.append("[需要你的回答]")
@@ -316,19 +324,22 @@ def status_line(snap: Dict[str, Any], view: ChatView) -> str:
         parts.append("[捲動中" + (f"，{view.unseen} 則新訊息" if view.unseen else "") + "；End 回到最新]")
     agents = snap.get("agents") or []
     for a in agents:
+        name = one_line(a.get("name"))
         if a.get("running"):
-            s = f"{a['name']} 執行中 {fmt_elapsed(a['elapsed'])}"
+            s = f"{name} 執行中 {fmt_elapsed(a['elapsed'])}"
             q = a.get("quiet")
             if q is not None and q >= 5:
                 s += f"，{fmt_quiet(q)}沒有輸出"
-            if a.get("tool"):
-                s += f"，工具 {a['tool']}（{fmt_elapsed(a.get('tool_ago') or 0)}前）"
-            if a.get("task"):
-                s += f"，任務 {a['task']}"
+            tool = one_line(a.get("tool"))
+            if tool:
+                s += f"，工具 {tool}（{fmt_elapsed(a.get('tool_ago') or 0)}前）"
+            task = one_line(a.get("task"))
+            if task:
+                s += f"，任務 {task}"
         else:
-            s = f"{a['name']} 閒置"
+            s = f"{name} 閒置"
         if a.get("queued"):
-            s += f"（佇列 {a['queued']}）"
+            s += f"（佇列 {int(a['queued'])}）"
         parts.append(f"[{s}]")
     state = snap.get("state")
     if snap.get("hold"):
@@ -344,7 +355,7 @@ def status_line(snap: Dict[str, Any], view: ChatView) -> str:
         parts.append("Manager 等待 Worker")
     st = snap.get("import_stage")
     if st and st != "ready":
-        parts.append(f"匯入：{st}")
+        parts.append(f"匯入：{one_line(st, 20)}")
     return " ".join(parts) or "準備中"
 
 

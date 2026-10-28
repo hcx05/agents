@@ -217,6 +217,72 @@ class TestEntriesAndStatus(unittest.TestCase):
         snap["agents"][0]["tool"] = None
         self.assertNotIn("工具", status_line(snap, v))
 
+    EVIL = "\x1b[31mRED\x1b[0m\x1b]0;PWNED\x07\x1b]52;c;QUFB\x07\u202eTXET\u202c\u2066x\u2069\x00\x08\r\nNEXT\x9b31m\u200b"
+
+    def evil_snap(self):
+        e = self.EVIL
+        return {"state": "running", "agents": [
+            {"name": "Man" + e + "ager", "running": True, "elapsed": 3.0, "quiet": 9.0, "tool": "Re" + e + "ad",
+             "tool_ago": 1.0, "task": "t" + e + "1", "queued": 0},
+            {"name": "W" + e, "running": False, "queued": 0}], "import_stage": e}
+
+    def test_status_text_from_dynamic_fields_is_neutralised(self):
+        s = status_line(self.evil_snap(), ChatView())
+        for bad in ("\x1b", "\x07", "\x00", "\x08", "\r", "\n", "\x9b", "\u202e", "\u202c", "\u2066", "\u2069", "\u200b"):
+            self.assertNotIn(bad, s, repr(bad))
+        self.assertIn("工具 Re", s)
+        self.assertIn("執行中 3s", s)                                      # the real status words are untouched
+
+    def test_normal_names_keep_their_cjk_and_punctuation(self):
+        snap = {"agents": [{"name": "員工 w1", "running": True, "elapsed": 1.0, "quiet": 0, "tool": "mcp__fs__read_file-2.0",
+                            "tool_ago": 2.0, "task": "任務-A_1.2", "queued": 2}]}
+        s = status_line(snap, ChatView())
+        self.assertIn("員工 w1 執行中 1s", s)
+        self.assertIn("工具 mcp__fs__read_file-2.0", s)
+        self.assertIn("任務 任務-A_1.2", s)
+        self.assertIn("（佇列 2）", s)
+
+    def test_long_dynamic_values_are_capped_and_none_is_not_shown(self):
+        snap = {"agents": [{"name": "x" * 500, "running": True, "elapsed": 1.0, "quiet": 0, "tool": "y" * 500,
+                            "tool_ago": 1.0, "task": None, "queued": 0}]}
+        s = status_line(snap, ChatView())
+        self.assertLess(len(s), 200)
+        self.assertNotIn("None", s)
+        self.assertNotIn("任務", s)
+
+    def test_headers_of_chat_entries_are_cleaned_too(self):
+        v = ChatView()
+        TuiUI(v, lambda: None).chat("Wor\x1b[31mker\u202e\nx", "hi", "Man\x07ager")
+        head = texts(v.window_rows(80, 10))[0]
+        for bad in ("\x1b", "\x07", "\u202e"):
+            self.assertNotIn(bad, head)
+
+    def test_what_prompt_toolkit_really_writes_for_hostile_text(self):
+        """Measured behaviour (not assumed): ESC / BEL / NUL / C1 are drawn as inert caret text by prompt_toolkit itself;
+        bidi overrides would reach the terminal. With the cleaning above nothing hostile is written - checked on the raw
+        bytes of a real render of the status bar and the timeline."""
+        import io
+        from prompt_toolkit.data_structures import Size
+        from prompt_toolkit.output.vt100 import Vt100_Output
+        buf = io.StringIO()
+        with create_pipe_input() as pipe:
+            out = Vt100_Output(buf, lambda: Size(12, 100), term="xterm-256color")
+            snap = self.evil_snap()
+            app = TuiApp(lambda s: None, lambda: snap, lambda: False, input=pipe, output=out)
+            app.ui.chat("Manager", "msg " + self.EVIL)
+            app.ui.system("sys " + self.EVIL)
+            t = threading.Thread(target=app.run, daemon=True)
+            t.start()
+            self.assertTrue(until(lambda: app.app.is_running and getattr(app.app, "loop", None) is not None))
+            time.sleep(0.5)
+            app.request_exit()
+            t.join(5)
+        raw = buf.getvalue()
+        self.assertIn("TXET", raw)                                          # it did render the visible text
+        for bad in ("\u202e", "\u202c", "\u2066", "\u2069", "\x1b]", "\x07", "\x00", "\x9b", "\u200b"):
+            self.assertNotIn(bad, raw, repr(bad))
+        self.assertNotIn("\x1b[31mRED", raw)
+
     def test_status_waiting_hold_and_scroll_hint(self):
         v = ChatView()
         idle = {"name": "Manager", "running": False, "queued": 0}
@@ -560,18 +626,47 @@ class TestPlainFallback(unittest.TestCase):
                 with mock.patch.object(sys, "stdin", i), mock.patch.object(sys, "stdout", o):
                     self.assertEqual(cli._tui_decision(self.args()), (False, None))
 
-    @unittest.skipUnless(HAVE_PTK, "prompt_toolkit not installed")
-    def test_missing_prompt_toolkit_falls_back_with_a_hint(self):
+    def decide(self, **patches):
         from unittest import mock
         from agent import cli
         tty = mock.Mock(isatty=lambda: True)
+        env = {k: v for k, v in os.environ.items() if k not in ("AGENT_PLAIN", "TERM")}
         with mock.patch.object(sys, "stdin", tty), mock.patch.object(sys, "stdout", tty), \
-                mock.patch.dict(sys.modules, {"agent.tui": None}), \
-                mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k not in ("AGENT_PLAIN", "TERM")},
-                                clear=True):
-            use, hint = cli._tui_decision(self.args())
+                mock.patch.dict(os.environ, env, clear=True):
+            if "import_module" in patches:
+                with mock.patch.object(cli.importlib, "import_module", side_effect=patches["import_module"]):
+                    return cli._tui_decision(self.args())
+            with mock.patch.dict(sys.modules, patches.get("modules", {})):
+                return cli._tui_decision(self.args())
+
+    @unittest.skipUnless(HAVE_PTK, "prompt_toolkit not installed")
+    def test_missing_prompt_toolkit_falls_back_with_the_install_hint(self):
+        from unittest import mock
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("agent.tui", None)
+            block = {k: None for k in list(sys.modules) if k.split(".")[0] == "prompt_toolkit"}
+            use, hint = self.decide(modules=block)
         self.assertFalse(use)
         self.assertIn("pip install", hint)
+        self.assertIn("沒有安裝", hint)
+        self.assertNotIn("程式錯誤", hint)
+
+    def test_a_bug_in_the_tui_module_is_reported_as_such_not_as_a_missing_package(self):
+        for exc in (NameError("name 'oops' is not defined"), SyntaxError("bad"), AttributeError("no attr"),
+                    ImportError("cannot import name 'Foo' from 'prompt_toolkit.layout'"),
+                    ModuleNotFoundError("No module named 'agent.helper'", name="agent.helper")):
+            use, hint = self.decide(import_module=exc)
+            self.assertFalse(use, exc)
+            self.assertNotIn("pip install \"prompt_toolkit", hint, exc)
+            self.assertIn("不是缺少套件", hint, exc)
+            self.assertIn(str(exc), hint)                                  # the real cause stays visible
+            self.assertIn(type(exc).__name__, hint)
+
+    def test_only_the_dependency_itself_counts_as_missing(self):
+        for name in ("prompt_toolkit", "prompt_toolkit.layout", "wcwidth"):
+            use, hint = self.decide(import_module=ModuleNotFoundError(f"No module named {name!r}", name=name))
+            self.assertFalse(use)
+            self.assertIn("pip install", hint, name)
 
     def test_flag_is_accepted_everywhere(self):
         from agent import cli

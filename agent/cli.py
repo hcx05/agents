@@ -58,6 +58,11 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tui_broken(e: BaseException) -> str:
+    return (f"全螢幕聊天室模組載入失敗，這不是缺少套件，而是版本不相容或程式錯誤：{type(e).__name__}: {e}。"
+            "已改用簡易模式（--plain 可不再顯示此訊息）；請回報這個錯誤，或確認 prompt_toolkit 版本 >= 3.0.36。")
+
+
 def _tui_decision(args: argparse.Namespace) -> Tuple[bool, Optional[str]]:
     """Full-screen chat room only for a real interactive terminal. Anything else (pipe, redirect, --plain, AGENT_PLAIN,
     TERM=dumb, prompt_toolkit missing) gets the original line-based chat. Returns (use_tui, hint for stderr)."""
@@ -67,9 +72,13 @@ def _tui_decision(args: argparse.Namespace) -> Tuple[bool, Optional[str]]:
         return False, None
     try:
         importlib.import_module(f"{__package__}.tui")
-    except Exception as e:
-        return False, (f"全螢幕聊天室需要 prompt_toolkit（{type(e).__name__}: {e}）。改用簡易模式；"
-                       "要啟用全螢幕請執行：pip install \"prompt_toolkit>=3.0.36\"（或加 --plain 不再提示）")
+    except ModuleNotFoundError as e:
+        if (e.name or "").split(".")[0] in ("prompt_toolkit", "wcwidth"):        # the dependency itself is missing
+            return False, ("全螢幕聊天室需要 prompt_toolkit，目前沒有安裝。改用簡易模式；"
+                           "要啟用全螢幕請執行：pip install \"prompt_toolkit>=3.0.36\"（或加 --plain 不再提示）")
+        return False, _tui_broken(e)
+    except Exception as e:                   # installed but unusable (old version, a bug in the TUI module): say so
+        return False, _tui_broken(e)
     return True, None
 
 
@@ -240,90 +249,94 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
         warns = []
         if imp_state is not None:
             store.update(**{"import": imp_state})          # the fork id is on disk before anything else happens
-    use_tui, hint = _tui_decision(args)
-    if hint:
-        print(hint, file=sys.stderr)
-    holder: Dict[str, Any] = {}
+    # From here to the end every path - including a failure while the screen or the replay is being set up - passes
+    # through the `finally`: the Engine (if started) is shut down and the Session lock is released.
+    started = False
     tuiapp = None
-    if use_tui:
-        try:
-            from .tui import TuiApp
-            tuiapp = TuiApp(lambda s: _tui_line(holder, s), lambda: holder["status"](), lambda: _tui_ctrl_c(holder))
-        except Exception as e:               # e.g. a console prompt_toolkit cannot drive (mintty): chat as before
-            print(f"全螢幕聊天室無法在這個終端啟動（{type(e).__name__}: {e}）。改用簡易模式（可加 --plain）。", file=sys.stderr)
-            tuiapp = None
-    plain = tuiapp.ui if tuiapp else ChatUI()
-    ui = RecordingUI(plain, store)
-    try:
-        engine = Engine(cfg, store, ui, cwd, adapter_factory=lambda ac: adapters[ac.id], resume=resumed)
-    except Exception:
-        lock.release()
-        raise
-    engine.start()
-    holder.update(engine=engine, ui=ui, app=tuiapp, status=engine.activity_snapshot)
-    mgr = cfg.agents[cfg.manager]
-    ui.banner(["Agent Team",
-               f"Manager: {adapters[mgr.id].display_name}" + (f" ({mgr.model})" if mgr.model else ""),
-               *[f"Worker: {adapters[w.id].display_name} [{w.id}]" + (f" ({w.model})" if w.model else "")
-                 for w in cfg.workers],
-               *([f"Imported Claude session: {store.state['import']['source_id']}  (copy: {store.state['import']['fork_id']})"]
-                 if store.state.get("import") else []),
-               f"Folder: {cwd}", f"Session log: {store.dir}", HELP_RESUMED if resumed else HELP_IN_CHAT])
-    if imp_state is not None:
-        ui.system(IMPORT_BOUNDARY.format(src=imp_state["source_id"], fork=imp_state["fork_id"]))
-    if resumed:
-        if store.state.get("import"):
-            plain.system(IMPORT_REPLAY_NOTE.format(src=store.state["import"]["source_id"]))
-        shown = replay(tuiapp.ui.replay_view() if tuiapp else plain, timeline(Store.read_events(store.dir)),
-                       getattr(args, "replay", 60))
-        for w in warns:
-            ui.system("注意：" + w)
-        for kind, text in engine.restore_report:
-            (ui.ask_user if kind == "ask_user" else ui.system)(text)
-    engine.check_cli_versions()          # background; a slow or failing --version never delays or blocks the chat
-    interactive = sys.stdin.isatty()
     exit_code = 0
     try:
-        if tuiapp is not None:
+        use_tui, hint = _tui_decision(args)
+        if hint:
+            print(hint, file=sys.stderr)
+        holder: Dict[str, Any] = {}
+        if use_tui:
             try:
-                tuiapp.run()
-            except Exception as e:           # the screen failed; the engine and the saved session are untouched
-                exit_code = 1
-                print(f"全螢幕聊天室發生錯誤：{type(e).__name__}: {e}\n工作狀態已保存，可用 `agent resume {store.id}` "
-                      "繼續（加 --plain 使用簡易模式）。", file=sys.stderr)
-            return exit_code
-        while True:
-            try:
-                if not interactive:
-                    engine.wait_idle(cfg.turn_timeout_sec * (cfg.max_manager_turns_per_input + 2))
-                line = ui.read_line()
-            except KeyboardInterrupt:
-                if engine.is_quiescent():
-                    ui.system("Type /exit to quit.")
-                else:
-                    engine.interrupt()
-                continue
-            if line is None:
-                if not interactive:
-                    engine.wait_idle(cfg.turn_timeout_sec * (cfg.max_manager_turns_per_input + 2))
-                break
-            s = line.strip()
-            if not s:
-                continue
-            if s.startswith("/"):
-                if _run_slash(engine, ui, s):
+                from .tui import TuiApp
+                tuiapp = TuiApp(lambda s: _tui_line(holder, s), lambda: holder["status"](), lambda: _tui_ctrl_c(holder))
+            except Exception as e:               # e.g. a console prompt_toolkit cannot drive (mintty): chat as before
+                print(f"全螢幕聊天室無法在這個終端啟動（{type(e).__name__}: {e}）。改用簡易模式（可加 --plain）。", file=sys.stderr)
+                tuiapp = None
+        plain = tuiapp.ui if tuiapp else ChatUI()
+        ui = RecordingUI(plain, store)
+        engine = Engine(cfg, store, ui, cwd, adapter_factory=lambda ac: adapters[ac.id], resume=resumed)
+        engine.start()
+        started = True
+        holder.update(engine=engine, ui=ui, app=tuiapp, status=engine.activity_snapshot)
+        mgr = cfg.agents[cfg.manager]
+        ui.banner(["Agent Team",
+                   f"Manager: {adapters[mgr.id].display_name}" + (f" ({mgr.model})" if mgr.model else ""),
+                   *[f"Worker: {adapters[w.id].display_name} [{w.id}]" + (f" ({w.model})" if w.model else "")
+                     for w in cfg.workers],
+                   *([f"Imported Claude session: {store.state['import']['source_id']}  (copy: {store.state['import']['fork_id']})"]
+                     if store.state.get("import") else []),
+                   f"Folder: {cwd}", f"Session log: {store.dir}", HELP_RESUMED if resumed else HELP_IN_CHAT])
+        if imp_state is not None:
+            ui.system(IMPORT_BOUNDARY.format(src=imp_state["source_id"], fork=imp_state["fork_id"]))
+        if resumed:
+            if store.state.get("import"):
+                plain.system(IMPORT_REPLAY_NOTE.format(src=store.state["import"]["source_id"]))
+            shown = replay(tuiapp.ui.replay_view() if tuiapp else plain, timeline(Store.read_events(store.dir)),
+                           getattr(args, "replay", 60))
+            for w in warns:
+                ui.system("注意：" + w)
+            for kind, text in engine.restore_report:
+                (ui.ask_user if kind == "ask_user" else ui.system)(text)
+        engine.check_cli_versions()          # background; a slow or failing --version never delays or blocks the chat
+        interactive = sys.stdin.isatty()
+        try:
+            if tuiapp is not None:
+                try:
+                    tuiapp.run()
+                except Exception as e:           # the screen failed; the engine and the saved session are untouched
+                    exit_code = 1
+                    print(f"全螢幕聊天室發生錯誤：{type(e).__name__}: {e}\n工作狀態已保存，可用 `agent resume {store.id}` "
+                          "繼續（加 --plain 使用簡易模式）。", file=sys.stderr)
+                return exit_code
+            while True:
+                try:
+                    if not interactive:
+                        engine.wait_idle(cfg.turn_timeout_sec * (cfg.max_manager_turns_per_input + 2))
+                    line = ui.read_line()
+                except KeyboardInterrupt:
+                    if engine.is_quiescent():
+                        ui.system("Type /exit to quit.")
+                    else:
+                        engine.interrupt()
+                    continue
+                if line is None:
+                    if not interactive:
+                        engine.wait_idle(cfg.turn_timeout_sec * (cfg.max_manager_turns_per_input + 2))
                     break
-                continue
-            engine.submit(s)
-    except KeyboardInterrupt:
-        pass
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith("/"):
+                    if _run_slash(engine, ui, s):
+                        break
+                    continue
+                engine.submit(s)
+        except KeyboardInterrupt:
+            pass
     finally:
-        engine.shutdown()
-        bye = f"Bye. Session saved: {store.dir}" + (f"  (resume with: agent resume {store.id})")
-        ui.system(bye)
-        if tuiapp is not None:
-            print(bye)                       # the full screen is gone: say it on the normal terminal
-        lock.release()
+        try:
+            if started:                  # an Engine that never started has nothing to stop (shutdown() would wait)
+                engine.shutdown()
+                bye = f"Bye. Session saved: {store.dir}" + (f"  (resume with: agent resume {store.id})")
+                ui.system(bye)
+                if tuiapp is not None:
+                    print(bye)           # the full screen is gone: say it on the normal terminal
+        finally:
+            lock.release()               # whatever failed above, the session lock is let go (release() is idempotent)
     return exit_code
 
 
