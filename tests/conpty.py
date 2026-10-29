@@ -43,11 +43,14 @@ k32.CreatePseudoConsole.restype = ctypes.HRESULT
 k32.ResizePseudoConsole.argtypes = [HPCON, COORD]
 k32.ResizePseudoConsole.restype = ctypes.HRESULT
 k32.ClosePseudoConsole.argtypes = [HPCON]
+k32.ClosePseudoConsole.restype = None
 k32.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t)]
 k32.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
                                           ctypes.c_void_p, ctypes.c_void_p]
-k32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
+k32.CreateProcessW.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
                                ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(STARTUPINFOEXW), ctypes.POINTER(PROCESS_INFORMATION)]
+k32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+k32.DeleteProcThreadAttributeList.restype = None
 k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
 k32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
 k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
@@ -61,26 +64,29 @@ class ConPty:
         self.buf = bytearray()
         in_r, in_w = wintypes.HANDLE(), wintypes.HANDLE()
         out_r, out_w = wintypes.HANDLE(), wintypes.HANDLE()
-        k32.CreatePipe(ctypes.byref(in_r), ctypes.byref(in_w), None, 0)
-        k32.CreatePipe(ctypes.byref(out_r), ctypes.byref(out_w), None, 0)
+        for r, w in ((in_r, in_w), (out_r, out_w)):
+            if not k32.CreatePipe(ctypes.byref(r), ctypes.byref(w), None, 0):
+                raise ctypes.WinError(ctypes.get_last_error())
         self.hpc = HPCON()
         k32.CreatePseudoConsole(COORD(cols, rows), in_r, out_w, 0, ctypes.byref(self.hpc))
         k32.CloseHandle(in_r)
         k32.CloseHandle(out_w)
         self._in_w, self._out_r = in_w, out_r
         size = ctypes.c_size_t()
-        k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+        k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))      # sizing call: fails by design
         self._attrs = ctypes.create_string_buffer(size.value)
-        k32.InitializeProcThreadAttributeList(self._attrs, 1, 0, ctypes.byref(size))
+        if not k32.InitializeProcThreadAttributeList(self._attrs, 1, 0, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
         if not k32.UpdateProcThreadAttribute(self._attrs, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, self.hpc.value, ctypes.sizeof(HPCON), None, None):
             raise ctypes.WinError(ctypes.get_last_error())
         si = STARTUPINFOEXW()
         si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
         si.lpAttributeList = ctypes.cast(self._attrs, ctypes.c_void_p)
-        si.StartupInfo.dwFlags = 0x100          # STARTF_USESTDHANDLES with null handles: do not inherit our own stdio
+        # No STARTF_USESTDHANDLES: the pseudo console supplies the child's stdin/stdout/stderr. With the flag set and null
+        # handles the child would get no standard handles at all. Our own stdio is not inherited (bInheritHandles=FALSE).
         pi = PROCESS_INFORMATION()
         envblock = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
-        cmd = subprocess.list2cmdline(args)
+        cmd = ctypes.create_unicode_buffer(subprocess.list2cmdline(args))      # CreateProcessW may write into it
         envbuf = ctypes.create_unicode_buffer(envblock, len(envblock))
         ok = k32.CreateProcessW(None, cmd, None, None, False, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                                 ctypes.cast(envbuf, ctypes.c_void_p), str(cwd), ctypes.byref(si), ctypes.byref(pi))
@@ -88,14 +94,13 @@ class ConPty:
             raise ctypes.WinError(ctypes.get_last_error())
         self._proc = pi.hProcess
         k32.CloseHandle(pi.hThread)
-        self._stop = threading.Event()
         self._t = threading.Thread(target=self._pump, daemon=True)
         self._t.start()
 
     def _pump(self):
         chunk = ctypes.create_string_buffer(65536)
         n = wintypes.DWORD()
-        while not self._stop.is_set():
+        while True:              # drain until the pipe breaks: ClosePseudoConsole waits for its last output to be read
             if not k32.ReadFile(self._out_r, chunk, 65536, ctypes.byref(n), None) or n.value == 0:
                 return
             self.buf.extend(chunk.raw[:n.value])
@@ -127,8 +132,8 @@ class ConPty:
 
     def close(self):
         self.kill()
-        self._stop.set()
         k32.ClosePseudoConsole(self.hpc)       # also ends the output pipe, which stops the reader
         self._t.join(3)
+        k32.DeleteProcThreadAttributeList(self._attrs)
         for h in (self._in_w, self._out_r, self._proc):
             k32.CloseHandle(h)

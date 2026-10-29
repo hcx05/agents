@@ -560,9 +560,9 @@ import os  # noqa: E402
 import subprocess  # noqa: E402
 
 
-@unittest.skipUnless(HAVE_PTK and os.name == "posix", "needs prompt_toolkit and a POSIX pseudo terminal")
+@unittest.skipUnless(HAVE_PTK, "needs prompt_toolkit")
 class TestHistoryOnARealScreen(tt.TestWholeRunInAPty):
-    """`python -m agent resume <id> --replay 0` on a pseudo terminal: Up brings the earlier message into the box."""
+    """`python -m agent resume <id> --replay 0` on a pseudo terminal (POSIX pty, or ConPTY on Windows): Up brings the earlier message into the box."""
 
     test_full_flow_then_resume = None            # inherited tests belong to test_tui, run them only there
     test_replay_zero_shows_no_history = None
@@ -575,22 +575,21 @@ class TestHistoryOnARealScreen(tt.TestWholeRunInAPty):
         self.assertEqual(r.returncode, 0, r.stderr)
         sess, ev = self.events()
         n_events = len(ev)
-        proc, master, buf, close = self.spawn(["resume", sess.name, "--replay", "0"], {"manager": [], "w1": []})
+        term = self.spawn(["resume", sess.name, "--replay", "0"], {"manager": [], "w1": []})
         try:
-            self.assertTrue(tt.until(lambda: b"\x1b[?1049h" in buf, 20))
+            self.assertTrue(tt.until(lambda: self.ready(term), 20), bytes(term.buf[-400:]))
             time.sleep(1.0)
-            self.assertNotIn(msg.encode(), bytes(buf))                    # --replay 0: not on screen yet
-            os.write(master, b"\x1b[A")                                    # Up
-            self.assertTrue(tt.until(lambda: msg.encode() in bytes(buf), 10), bytes(buf[-400:]))
+            self.assertNotIn(msg.encode(), bytes(term.buf))               # --replay 0: not on screen yet
+            term.write(b"\x1b[A")                                         # Up
+            self.assertTrue(tt.until(lambda: msg.encode() in bytes(term.buf), 10), bytes(term.buf[-400:]))
             time.sleep(0.5)
-            os.write(master, b"\x03")                                      # Ctrl+C clears the box, sends nothing
+            term.write(b"\x03")                                           # Ctrl+C clears the box, sends nothing
             time.sleep(0.3)
-            os.write(master, b"/exit\r")
-            self.assertEqual(proc.wait(30), 0, bytes(buf[-500:]))
+            term.write(b"/exit\r")
+            self.assertEqual(term.wait(30), 0, bytes(term.buf[-500:]))
         finally:
-            if proc.poll() is None:
-                proc.kill()
-            close()
+            if term.poll() is None:
+                term.kill()
         _, ev2 = self.events()
         new = ev2[n_events:]
         self.assertEqual([e for e in new if e.get("type") in ("chat", "turn_start")], [])

@@ -159,9 +159,9 @@ class TestStyles(unittest.TestCase):
 class TestHeaderLayout(unittest.TestCase):
     MGR = {"agent": "manager", "cli": "claude", "source": "reported", "reported": "claude-sonnet-5-5", "models": ["claude-sonnet-5-5"]}
 
-    def view(self, sym=UNICODE):
+    def view(self, sym=None):               # UNICODE only exists when prompt_toolkit is installed: not a def-time default
         v = ChatView()
-        v.symbols = sym
+        v.symbols = UNICODE if sym is None else sym
         return v, TuiUI(v, lambda: None)
 
     def test_rows_never_exceed_the_width_in_either_symbol_mode(self):
