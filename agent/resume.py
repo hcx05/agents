@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Config
+from .store import _valid_ts
 
 
 def _norm(path: Optional[str]) -> str:
@@ -104,10 +105,16 @@ def replay(ui: Any, items: List[Dict[str, Any]], limit: int) -> int:
 def format_sessions(rows: List[Dict[str, Any]], limit: int = 20) -> str:
     if not rows:
         return "No saved sessions."
-    rows = sorted(rows, key=lambda r: r.get("updated") or 0)[-limit:]
+
+    def _sort_key(r: Dict[str, Any]) -> float:
+        ts = _valid_ts(r.get("updated"))
+        return ts if ts is not None else -1.0
+
+    rows = sorted(rows, key=_sort_key)[-limit:]
     out = [f"{'ID':<28} {'UPDATED':<16} {'STATE':<16} {'CLIs':<12} FOLDER / FIRST MESSAGE"]
     for r in rows:
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["updated"])) if r.get("updated") else "?"
+        ts = _valid_ts(r.get("updated"))
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts is not None else "?"
         flags = ("" if r["ok"] else " [state.json unreadable]") + (" [IN USE]" if r["locked"] else "") \
             + (" [v1]" if r.get("version") == 1 else "") \
             + (f" [import {r['import_source'][:8]}]" if r.get("import_source") else "")

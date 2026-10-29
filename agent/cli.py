@@ -14,7 +14,6 @@ from . import __version__, importer
 from .adapters import get_adapter
 from .config import ConfigError, config_path, ensure_config, home_dir, load_config
 from .orchestrator import Engine
-from .inputhistory import user_inputs
 from .resume import check_compat, format_sessions, replay, timeline
 from .sessionlock import SessionLock, SessionLocked
 from .store import Store, StoreError, safe_session_dir
@@ -314,14 +313,10 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
         if hint:
             print(hint, file=sys.stderr)
         holder: Dict[str, Any] = {}
-        # Read once, before the Engine exists (it logs no chat or ui events while starting): the same list feeds the
-        # Up-arrow history of the screen and the replay below. `--replay 0` only limits the replay, never the history.
-        prior = Store.read_events(store.dir) if resumed else []
         if use_tui:
             try:
                 from .tui import TuiApp
-                tuiapp = TuiApp(lambda s: _tui_line(holder, s), lambda: holder["status"](), lambda: _tui_ctrl_c(holder),
-                                history=user_inputs(prior))
+                tuiapp = TuiApp(lambda s: _tui_line(holder, s), lambda: holder["status"](), lambda: _tui_ctrl_c(holder))
             except Exception as e:               # e.g. a console prompt_toolkit cannot drive (mintty): chat as before
                 print(f"全螢幕聊天室無法在這個終端啟動（{type(e).__name__}: {e}）。改用簡易模式（可加 --plain）。", file=sys.stderr)
                 tuiapp = None
@@ -344,7 +339,7 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
         if resumed:
             if store.state.get("import"):
                 plain.system(IMPORT_REPLAY_NOTE.format(src=store.state["import"]["source_id"]))
-            shown = replay(tuiapp.ui.replay_view() if tuiapp else plain, timeline(prior),
+            shown = replay(tuiapp.ui.replay_view() if tuiapp else plain, timeline(Store.read_events(store.dir)),
                            getattr(args, "replay", 60))
             for w in warns:
                 ui.system("注意：" + w)

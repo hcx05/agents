@@ -29,9 +29,14 @@ agent --help
 ## 使用
 
 ```powershell
-agent config          # 建立（若不存在）並顯示 %APPDATA%\agent\config.json 的路徑與檢查結果
-agent config --show   # 另外印出內容
-agent                 # 進入聊天室（以目前資料夾為 Agent 的工作資料夾）
+agent config                    # 建立（若不存在）並顯示 %APPDATA%\agent\config.json 的路徑與檢查結果
+agent config --show             # 另外印出內容
+agent                           # 建立新 Session 並進入聊天室（以目前資料夾為工作資料夾）
+agent pick                      # 開啟全螢幕 Session Picker（搜尋、預覽、選擇既有對話或按 Ctrl+N 開新對話）
+agent sessions                  # 以純文字清單列出已保存的 Agent Session
+agent resume <Agent Session ID> # 直接恢復指定的 Agent Session
+agent <Claude Session UUID>     # 匯入原生 Claude Session（以副本繼續，不修改原對話）
+agent --plain                   # 強制使用簡易行模式
 ```
 
 聊天室指令：`/status`（狀態、各 Agent Session ID、未完成任務）、`/interrupt`（中斷正在跑的 turn；
@@ -52,12 +57,6 @@ agent                           # 全螢幕；agent --plain 強制簡易模式�
 - **固定在底部的輸入框**，上方一行標明「Agent 聊天室（輸入送給 Manager，不是 PowerShell）」。Agent 工作時可繼續輸入，新訊息不會動到你正在打的字。
 - 按鍵：`Enter` 送出；`Ctrl+J`（或 `Alt+Enter`）換行，**不依賴 Shift+Enter**；`PgUp` / `PgDn` 捲動歷史；`End`（輸入框空白時）或 `Ctrl+End` 回到最新；
   `Ctrl+C` 在有工作進行時等同 `/interrupt`，否則清除輸入框草稿；`Ctrl+D`（輸入框空白）離開；`/exit` 離開。貼上多行文字不會觸發送出。
-- **輸入歷史**：`Up` / `Down` 瀏覽你先前送出的訊息（多行草稿內先正常移動游標，到第一行才往更舊的歷史、到最後一行才往較新的歷史）；
-  `Ctrl+P` / `Ctrl+N` 不管游標在哪一行都直接跳到上一筆／下一筆。尚未送出的草稿會保留，回到最新位置時還原。帶回輸入框的歷史可以先修改，
-  按 `Enter` 才會送出（選取歷史本身不會呼叫模型、不會寫入紀錄、不會執行 `/status` 之類指令）。連續兩次送出相同內容只記一筆；最多保留最近 200 筆。
-  `agent resume <id>` 會從該 Session 的 `events.jsonl` 讀回你先前的訊息（只取 `chat` 事件中 `sender` 為 `Me` 者，最近 200 筆；已被遮蔽成 `[REDACTED]` 的整則略過；
-  不讀 Manager／Worker／系統訊息、原始輸出或 Claude 原生紀錄），`--replay 0` 只是不重播畫面，仍可按 `Up`。斜線指令只在同一次執行中可回溯，resume 後不會恢復。
-  不會建立任何新檔案，也不跨 Session。
 - 往上讀歷史時，新訊息**不會把畫面拉走**；狀態列會顯示「捲動中，N 則新訊息；End 回到最新」。送出訊息會自動回到最新。
 - **狀態列**（輸入框上方）：各 Agent 閒置／執行中、已執行時間、多久沒有新輸出、進行中的任務、佇列數，以及「等你回答」「已暫停」「Manager 等待 Worker」。
   只顯示 Engine 真正知道的事：Claude 回報的工具**名稱**（不含參數）才會出現，agy 與其他 CLI 不會有；**不會有**進度百分比、token 數或編造的動作。
@@ -65,6 +64,30 @@ agent                           # 全螢幕；agent --plain 強制簡易模式�
 - **重播（resume）**：先前的對話以暗色並在左側加 `| ` 標示，前後有「以下是先前的對話／到此為止」分隔，唯讀、不呼叫模型、不重複寫入紀錄；`--replay 0` 完全不顯示。
   原生 Claude Session 的歷史永遠不會被當成 Agent 聊天顯示。
 - 離開後回到一般終端機並印出 `Bye. Session saved … (resume with: agent resume <id>)`。畫面層出錯不會動到已保存的 Session（`finally` 仍會關閉 Engine、放掉鎖）。
+
+### 全螢幕 Session Picker：`agent pick`
+
+```powershell
+agent pick                      # 開啟 Telescope 風格全螢幕對話選擇器（Find -> Filter -> Preview -> Pick）
+```
+
+- **行為與分工**：
+  - `agent pick` 開啟全螢幕 Session Picker，可即時搜尋、預覽並選擇既有 Agent Session。
+  - `agent` 仍然直接建立新 Session（預設行為不變）。
+  - `agent sessions` 仍然輸出純文字清單；`agent resume <Agent Session ID>` 仍然直接恢復指定對話。
+  - 在 Picker 中選定 Session 按 `Enter` 後，選擇器會先結束自己的全螢幕畫面，再交由既有 `cmd_resume` 流程處理（包含原有的 Session ID 安全驗證、設定與工作目錄相容性檢查、OS Session Lock、狀態恢復與 Replay）。
+- **快捷鍵**：
+  - **直接輸入文字**：於頂部搜尋框即時篩選（支援 Agent Session ID、工作資料夾路徑、第一則使用者訊息完整內容、狀態與 CLI 描述；英文不分大小寫，支援中文搜尋）。
+  - **`↑` / `↓`**（或 `Ctrl+P`、`PgUp` / `PgDn`）：上下切換選取的 Session，右側同步更新預覽。
+  - **`Enter`**：恢復目前選定的 Session。
+  - **`Ctrl+N`**：關閉選擇器並在目前資料夾建立新 Session。
+  - **`Esc`**（或 `Ctrl+C`、空輸入框下 `Ctrl+D`）：取消並安全退出（不建立 Session、不呼叫模型、不修改任何檔案）。
+- **安全與唯讀保證**：
+  - **預覽完全唯讀**：在正式按下 `Enter` 恢復或 `Ctrl+N` 建立新對話前，瀏覽、搜尋與預覽過程**絕不呼叫模型**、**不啟動 Engine**、**不建立 Agent Session**、**不建立 Claude Fork**、**不修改 `state.json` 或 `events.jsonl`**，也不掃描或修改 Claude 原生 Transcript。
+  - **已鎖定的 Session 不能強行恢復**：正在被其他程序使用的對話會標示 `[LOCKED]`；即使按下 `Enter`，正式 Resume 流程仍會再次檢查 OS 檔案鎖並拒絕強行接手。
+  - **不同工作目錄不會自動套用 `--here`**：若 Session 原始工作資料夾與目前目錄不同，列表與預覽會顯示 `[不同資料夾]` 警告；按下 `Enter` 後仍維持原有安全限制拒絕跨目錄直接恢復（需切換回原目錄，或手動執行 `agent resume <ID> --here`）。
+  - **損壞或異常資料安全降級**：若某筆 Session 的 `state.json` 損壞、版本不相容、Metadata 不完整或含有異常時間戳（如 `NaN`、`1e400`、超出系統範圍數值），Picker 與非 TTY 模式皆會安全降級顯示（標示 `[損壞]` 或未知時間），不會崩潰也不會改寫原檔。
+  - **非 TTY 與 Fallback**：在管線／非 TTY、`TERM=dumb`、`--plain` 或未安裝 `prompt_toolkit` 的環境執行 `agent pick` 時，會印出提示訊息與純文字 Session 清單，不會崩潰也不會意外建立新 Session。
 
 ### 恢復對話：`agent sessions` / `agent resume <id>`
 
@@ -127,7 +150,7 @@ Manager 會接續該 Session 的**副本**（Claude 的 `--fork-session`），�
 
 ```powershell
 # 1. 在一個拋棄式資料夾開互動式 Claude，聊幾輪（例如：請記住暗號 PINEAPPLE-42，並描述你正在整理的主題），然後 /exit
-mkdir $env:TEMPork-test; cd $env:TEMPork-test; claude
+mkdir $env:TEMP\fork-test; cd $env:TEMP\fork-test; claude
 
 # 2. 找出該 Session 的 ID（= 最新 .jsonl 的檔名，不含副檔名），並記下原檔的雜湊
 Get-ChildItem $env:USERPROFILE\.claude\projects -Recurse -Filter *.jsonl | Sort-Object LastWriteTime | Select-Object -Last 3 FullName, Length, LastWriteTime
@@ -219,6 +242,7 @@ Manager 再告訴你需要怎麼授權。Manager 被指示在刪除/覆寫/部�
 
 ```powershell
 py -m unittest discover -s tests -t .        # Fake CLI：完整 Manager→Worker→Manager→User 流程，不耗額度
+py -m unittest tests.test_picker -v          # Session Picker 專屬自動化測試
 py tests\demo.py                              # 離線示範聊天室
 py probe.py claude                            # 真實 CLI 探測（耗少量額度，在暫存資料夾）
 py probe.py agy
@@ -238,7 +262,9 @@ Ctrl+Break/taskkill 清理（agy 另測 `--conversation`/`--json-schema` 是否�
 | **agy 1.4.9** 官方 `init→step_update→result` 解析、`--effort` 傳遞、`--conversation` 一致性防護 | 僅以官方格式的模擬事件與 `tests/fake_agy.py` 測試；**未用真實 agy 驗證** |
 | agy `--conversation` ＋ stdin streaming、`--json-schema`、soft-denial 實際文字、Windows 行為 | **尚未實測**，請跑 `py probe.py agy` |
 | 全螢幕聊天室（`prompt_toolkit`）：Linux pseudo terminal＋腳本化按鍵（中文、`Ctrl+J`、括號貼上、捲動、背景訊息、重播、`/exit` 清理、非 TTY 退回簡易模式） | 通過 |
-| **全螢幕聊天室在 Windows 實機**（IME、貼上、縮放、按鍵辨識） | **尚未實測**，見上節手動驗收 |
+| **全螢幕聊天室在 Windows 實機**（IME、貼上、縮放、按鍵辨識） | **尚未實測**，見下節手動驗收 |
+| **Session Picker（`agent pick`）**：Linux 自動化測試（搜尋、完整首則訊息匹配、超過 200 筆前置事件搜尋、異常 timestamp 防護、Lock/不同目錄/損壞 Session 防護、唯讀預覽、快速移動快取、非 TTY 退回文字模式） | 通過 |
+| **Session Picker 在 Windows 實機**（Windows Terminal、傳統 PowerShell、中文 IME 組字與 Enter、視窗縮放、真實 CLI 恢復） | **尚未測試（待 Windows 實機驗收）**，見下節手動驗收步驟 |
 | Codex、多 Worker、`/resume` | 依規格不做 |
 
 ### 全螢幕聊天室的 Windows 手動驗收（PowerShell）
@@ -260,9 +286,50 @@ agent                                  # 1. 應進入全螢幕；底部輸入框
 7. `agent sessions`，再 `agent resume <id>`：先前對話為暗色、左側有 `| `，標明唯讀；沒有任何模型被呼叫。`agent resume <id> --replay 0` 不顯示歷史。
 8. `agent --plain` 以及 `"/exit" | agent`（管線）都是原本的簡易模式。`py -m pip uninstall prompt_toolkit` 後執行 `agent`：stderr 提示安裝方式並退回簡易模式。
 9. 匯入：`agent <Claude UUID>` 的確認流程與之前相同；進入全螢幕後第一則訊息才建立 Fork。
-10. 輸入歷史（Batch 3B）：依序送出 `你好`、`第二則`、`第三則`；按三次 `Up` 依序出現 第三則、第二則、你好，再按 `Down` 往回；打一半的草稿在 `Up` 後再 `Down` 回到最新時要還原；
-    多行草稿（`Ctrl+J`）內 `Up` 先移動游標、到第一行才換歷史；`Ctrl+P` / `Ctrl+N` 直接換筆；選到 `/status` 時只是出現在輸入框，要按 `Enter` 才會執行；
-    `/exit` 後 `agent resume <id>`（以及加 `--replay 0`）按 `Up` 應取回先前送出的訊息，且不會自動送出、不產生新的對話或 turn。
+
+### Session Picker（`agent pick`）的 Windows 手動驗收（PowerShell）
+
+> **注意**：以下驗收步驟提供於 Windows 實機執行驗證；目前開發環境為 Linux 沙盒，**Windows 實機環境尚未測試**，請依下列步驟逐項實機驗收。
+
+```powershell
+py -m pip install -e .
+py -m unittest tests.test_picker -v    # 先跑自動化測試
+```
+
+請在 **Windows Terminal** 與 **傳統 PowerShell 主控台（conhost）** 分別執行以下驗收步驟：
+
+1. **準備與唯讀基準雜湊**：
+   - 先用 `agent` 建立 2～3 筆不同內容的對話（其中一筆第一則訊息超過 80 字，結尾加上獨特關鍵字如 `TAILKEY-777`），完成後 `/exit`。
+   - 記錄 `%APPDATA%\agent\sessions` 下既有 Session 的檔案雜湊與數量：
+     ```powershell
+     Get-ChildItem "$env:APPDATA\agent\sessions" -Recurse -File | Get-FileHash | Format-Table Path, Hash
+     ```
+2. **啟動與畫面檢查（Windows Terminal ＆ 傳統 PowerShell 主控台）**：
+   - 執行 `agent pick`，確認進入全螢幕選擇器：頂部為 `搜尋> ` 輸入框、左側為按最後更新時間（由新到舊）排序的 Session 列表、右側為唯讀預覽（區分 `Me`、`Manager`、`Worker`）、底部為快捷鍵提示。
+3. **中文 IME 組字與 Enter**：
+   - 在搜尋框使用微軟注音／新注音輸入中文（例如「整理專案」），在輸入法選字階段按 `Enter` 確認候選字，確認**只完成組字、不會誤觸恢復 Session**；清除搜尋字元後列表恢復完整顯示。
+4. **中文與英文搜尋（含長訊息第 50 字元後關鍵字）**：
+   - 輸入英文關鍵字（大小寫混用，如 `tailkey-777`）、中文關鍵字、Session ID 片段、工作資料夾名稱：確認左側清單仍保持精簡截斷顯示，但能即時搜出關鍵字位於第 50 字元之後的 Session；輸入不存在的關鍵字時清楚顯示找不到符合對話的提示。
+5. **快速上下移動與長列表捲動**：
+   - 連續快速按住或連按 `↑` / `↓`、`PgUp` / `PgDn`：游標高亮移動順暢、不卡頓，右側預覽同步更新為目前選取項目的最近對話（最多 10 則）。
+6. **縮放視窗**：
+   - 拖動終端機視窗邊緣放寬、縮窄（縮至小於 68 欄時右側預覽自動隱藏，只留左側清單與底部摘要；拉寬後右側預覽自動恢復）：確認中英混排不破版、不崩潰，且仍可正常搜尋與選擇。
+7. **Esc 取消且完全唯讀驗證**：
+   - 在 Picker 內瀏覽、搜尋、切換多筆預覽後按 `Esc` 退出。
+   - 重新執行步驟 1 的 `Get-FileHash` 與目錄檢查：確認**沒有新增任何 Session 資料夾**、`state.json` 與 `events.jsonl` 雜湊完全不變、沒有建立 Claude Fork、也沒有呼叫任何模型。
+8. **`Ctrl+N` 建立新 Session**：
+   - 執行 `agent pick`，按 `Ctrl+N`：確認選擇器先乾淨關閉全螢幕，接著進入全新 Agent 聊天室；輸入 `/exit` 正常離開。
+9. **`Enter` 恢復正確 Session**：
+   - 執行 `agent pick`，用 `↑` / `↓` 或搜尋選定既有 Session 後按 `Enter`：確認先結束選擇器畫面，再進入該 Session 聊天室並重播先前對話（暗色 `| ` 標示），且未呼叫模型。
+10. **已鎖定 Session（Locked）防護**：
+    - 在視窗 A 執行 `agent resume <某個 Session ID>` 保持開啟（持有 `session.lock`）。
+    - 在視窗 B 執行 `agent pick`：確認該 Session 在列表與預覽顯示 `[LOCKED]`；選取它並按 `Enter`，確認沿用既有 Resume 檢查拒絕強行恢復（印出 `in use by another agent process`），且視窗 A 不受影響。
+11. **不同工作目錄的 Resume 限制**：
+    - `cd $env:TEMP`（切換到與原 Session 不同的資料夾），執行 `agent pick`：確認原 Session 顯示 `[不同資料夾]` 與預覽警告；按 `Enter` 後拒絕自動恢復並提示需切換目錄或使用 `agent resume <ID> --here`（確認不會自動加上 `--here`）。
+12. **非 TTY 退回文字模式**：
+    - 執行 `"" | agent pick` 或 `agent pick --plain`：確認不進入全螢幕、不崩潰、不建立新 Session，並在畫面印出提示訊息與可閱讀的 Session 清單。
+13. **損壞 Session 與異常時間戳處理**：
+    - 在 `%APPDATA%\agent\sessions\20261029-000000-badts` 建立測試目錄，放入 `state.json` 內容為 `{"version": 3, "updated": 1e400, "agents": {}}`，再分別執行 `agent pick` 與 `"" | agent pick`：確認兩者皆不崩潰，畫面顯示 `[損壞]` 與未知時間，按 `Enter` 拒絕恢復且不改寫該損壞檔案（測畢刪除該測試目錄）。
 
 ## 已知限制
 
@@ -271,7 +338,7 @@ agent                                  # 1. 應進入全螢幕；底部輸入框
 - 同時有 Manager 與 Worker 在跑時，檔案快照無法區分是誰改的。
 - `timeout` 是每個 turn 的總時間上限（`turn_timeout_sec`）。另有純提示用的「無輸出」提醒（`silence_warn_sec` 預設 60 秒、之後每 `silence_repeat_sec` 預設 300 秒最多一次，有新輸出即重算）；它不會中斷任務，也不代表模型正在「思考」，只表示 CLI 沒有新輸出。
 - 簡易行模式（`--plain`、非終端機）在等待輸入時若有非同步訊息插入，「正在輸入的文字」會暫時被清掉重畫提示列（文字仍在輸入緩衝區，按 Enter 照常送出）；全螢幕模式沒有這個問題。
-- 全螢幕聊天室：中文輸入法（IME）組字、Windows Terminal 的貼上、視窗縮放、`Ctrl+J` 辨識，目前只在 Linux 的 pseudo terminal 與腳本化輸入下測過，**Windows 實機尚未驗證**（見下節的手動驗收步驟）。
+- 全螢幕聊天室與 Session Picker：中文輸入法（IME）組字、Windows Terminal 的貼上、視窗縮放、`Ctrl+J` / `Ctrl+N` / `Esc` 辨識，目前只在 Linux 的 pseudo terminal 與腳本化輸入下測過，**Windows 實機尚未驗證**（見上節的手動驗收步驟）。
   畫面結構只用 ASCII 符號（避免 CJK 主控台把「模稜兩可寬度」符號畫成 2 格造成右邊界錯位）。不支援滑鼠、不渲染 Markdown。
 - 啟動時會在背景用官方 `--version` 記錄 CLI 版本（不耗額度、失敗不影響使用）；版本是否「已測試」見 `/status`，清單在 `agent/compat.py`，且不等於完全相容。
 - 中斷後，被中斷的 CLI Session 可能留有半截歷史；程式會告知 Manager「任務被中斷、檔案未還原」。

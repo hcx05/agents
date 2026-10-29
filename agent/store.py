@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -15,7 +16,12 @@ from typing import Any, Dict, List, Optional
 STATE_VERSION = 3
 RAW_LINE_MAX = 2000
 RAW_FILE_MAX = 2 * 1024 * 1024
-MAX_FIRST_SCAN_EVENTS = 200
+MAX_FIRST_MSG_SCAN_BYTES = 16 * 1024 * 1024   # safety cap when scanning a session that has no 'Me' message at all
+MAX_FIRST_MSG_CHARS = 65536                   # cap single first-message string kept in memory for search
+
+# Cross-platform valid timestamp range (POSIX + Windows MSVCRT localtime/strftime: 1970-01-01 .. 3000-01-01)
+_MIN_VALID_TS = 0.0
+_MAX_VALID_TS = 32503680000.0
 
 _PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
@@ -84,9 +90,21 @@ def safe_session_dir(sessions_root: Path, session_id: str) -> Path:
 
 
 def _valid_ts(val: Any) -> Optional[float]:
+    """Validate that `val` is a finite timestamp within cross-platform localtime/strftime limits."""
     if isinstance(val, bool) or not isinstance(val, (int, float)):
         return None
-    return float(val)
+    try:
+        f = float(val)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    if not math.isfinite(f) or f < _MIN_VALID_TS or f > _MAX_VALID_TS:
+        return None
+    try:
+        tm = time.localtime(f)
+        time.strftime("%Y-%m-%d %H:%M:%S", tm)
+    except (OSError, OverflowError, ValueError, TypeError):
+        return None
+    return f
 
 
 class Store:
@@ -170,6 +188,32 @@ class Store:
             return
 
     @staticmethod
+    def first_user_message(session_dir: Path, max_scan_bytes: int = MAX_FIRST_MSG_SCAN_BYTES) -> str:
+        """Read-only scan for the first user ('Me') chat message in `events.jsonl`.
+        Uses fast substring pre-filtering before JSON parsing and stops immediately on the first match."""
+        events_path = Path(session_dir) / "events.jsonl"
+        scanned = 0
+        try:
+            with open(events_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    scanned += len(line)
+                    if '"Me"' in line and '"chat"' in line:
+                        s = line.strip()
+                        if s:
+                            try:
+                                rec = json.loads(s)
+                            except ValueError:
+                                rec = None
+                            if isinstance(rec, dict) and rec.get("type") == "chat" and rec.get("sender") == "Me":
+                                txt = str(rec.get("text", "")).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+                                return txt[:MAX_FIRST_MSG_CHARS]
+                    if scanned >= max_scan_bytes:
+                        break
+        except OSError:
+            return ""
+        return ""
+
+    @staticmethod
     def read_events(session_dir: Path) -> List[Dict[str, Any]]:
         return list(Store.iter_events(session_dir))
 
@@ -220,7 +264,9 @@ class Store:
                 if not isinstance(st, dict):
                     raise ValueError("state.json is not an object")
                 created = _valid_ts(st.get("created"))
-                updated = _valid_ts(st.get("updated")) or created
+                updated = _valid_ts(st.get("updated"))
+                if updated is None:
+                    updated = created
                 row.update(version=st.get("version", 1), created=created, updated=updated,
                            cwd=st.get("cwd") if isinstance(st.get("cwd"), str) else None,
                            state=st.get("state") if isinstance(st.get("state"), str) else None,
@@ -231,12 +277,8 @@ class Store:
             except (OSError, ValueError, AttributeError, TypeError):
                 row["ok"] = False
             row["locked"] = SessionLock.is_locked(d)
-            for idx, rec in enumerate(Store.iter_events(d)):
-                if idx >= MAX_FIRST_SCAN_EVENTS:
-                    break
-                if rec.get("type") == "chat" and rec.get("sender") == "Me":
-                    row["first"] = str(rec.get("text", "")).replace("\n", " ")[:50]
-                    break
+            first_full = Store.first_user_message(d)
+            row["first"] = first_full[:50]
             out.append(row)
         return out
 

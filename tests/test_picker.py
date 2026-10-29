@@ -1,17 +1,24 @@
 """Automated tests for Batch 4A: Telescope-style Session Picker (`agent pick`).
 
-Covers all 28 required categories:
+Covers all 28 required categories plus Batch 4A code-review regression tests:
 - Basic functionality (1..8): loading, newest-first sorting, Chinese search, case-insensitive English search,
   Session ID search, folder search, no-match empty result, and empty sessions folder.
 - Keyboard operations (9..14): Up/Down navigation, Enter to resume, Ctrl+N for new session, Esc to exit,
-  rapid consecutive movement, and window resize / narrow-terminal reflow.
+  rapid consecutive movement (both unrendered burst and per-keypress full repaint), and window resize reflow.
 - Session safety (15..23): Locked session refusal (including TOCTOU lock check), different folder refusal
   (never auto-applying --here), damaged session resilience (corrupt JSON, bad version, incomplete metadata),
   strictly read-only preview (never modifying state.json or events.jsonl, even with half-written tail),
   zero model calls during preview, Esc creating nothing, existing resume validation handoff, and Claude
   Source/Fork UUID preservation.
 - Performance & compatibility (24..28): hundreds of sessions, large events.jsonl tail preview, non-TTY fallback,
-  missing prompt_toolkit fallback, and CLI command compatibility."""
+  missing prompt_toolkit fallback, and CLI command compatibility.
+- Review Regression Suite:
+  * P1-A: Full first user message search beyond 50 characters (Chinese + English case-insensitive + very long messages)
+    while keeping list display concise (<= 50 chars).
+  * P1-B: First user message appearing after > 200 system/UI events and amidst corrupted event lines.
+  * P1-C: Abnormal timestamp resilience (1e400, -1e400, NaN, Infinity, -Infinity, huge ints, negative timestamps,
+    missing updated, string updated) across _valid_ts, fmt_time, Store.summaries, format_sessions, PickerView,
+    and non-TTY `agent pick` subprocess runs."""
 from __future__ import annotations
 
 import argparse
@@ -33,7 +40,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from agent import cli, importer, picker  # noqa: E402
+from agent import cli, importer, picker, resume  # noqa: E402
 from agent.picker import (  # noqa: E402
     MIN_SPLIT_WIDTH,
     PREVIEW_MAX_ITEMS,
@@ -42,12 +49,13 @@ from agent.picker import (  # noqa: E402
     PickerControl,
     PickerView,
     filter_sessions,
+    fmt_time,
     load_session_items,
     read_recent_timeline,
     text_width,
 )
 from agent.sessionlock import LOCK_NAME, SessionLock  # noqa: E402
-from agent.store import STATE_VERSION  # noqa: E402
+from agent.store import STATE_VERSION, Store, _valid_ts  # noqa: E402
 from tests.rig import M, final  # noqa: E402
 
 try:
@@ -379,6 +387,52 @@ class TestKeyboardAndLayout(PickerTestBase):
         view.window_rows(100, 24)
         self.assertEqual(view.preview_cache.load_count, 1)
 
+    def test_13b_per_keypress_render_updates_preview_uses_cache_and_survives_damaged_session(self):
+        """Simulates rendering the screen on EVERY key press across multiple sessions including a damaged one."""
+        for i in range(8):
+            self.make_session(
+                f"20261028-14000{i}-step0{i}",
+                updated=2000.0 + i * 10,
+                first_msg=f"逐步預覽訊息_{i}",
+                extra_events=[{"type": "chat", "sender": "Manager", "to": "Me", "text": f"專屬預覽回覆內容_MARKER_{i}"}],
+            )
+        # Insert a damaged session right in the middle of the timeline
+        damaged_dir = self.sessions_root / "20261028-140099-midbad"
+        damaged_dir.mkdir()
+        (damaged_dir / "state.json").write_text('{"version": 999, "updated": 2035.0, "agents": {}}', encoding="utf-8")
+
+        view = PickerView(self.sessions_root, str(self.work))
+        total = len(view.filtered)
+        self.assertGreaterEqual(total, 10)
+
+        # Move Down step-by-step from 0 to total-1, rendering the full screen on EVERY step
+        for idx in range(total):
+            if idx > 0:
+                view.move(+1)
+            cur = view.selected_item
+            self.assertEqual(view.selected_index, idx)
+            screen_txt = "\n".join(flat_lines(view.window_rows(110, 26)))
+            self.assertIn(cur.id, screen_txt)
+            if not cur.ok:
+                self.assertIn("損壞", screen_txt)
+            elif cur.id.startswith("20261028-14000"):
+                step_num = cur.id.split("-")[1][-1]
+                self.assertIn(f"專屬預覽回覆內容_MARKER_{step_num}", screen_txt)
+
+        loads_after_down_pass = view.preview_cache.load_count
+        self.assertEqual(loads_after_down_pass, total)
+
+        # Now move Up step-by-step all the way back to index 0, rendering on EVERY step:
+        # every single preview must be served from the LRU cache without re-reading disk!
+        for idx in range(total - 2, -1, -1):
+            view.move(-1)
+            cur = view.selected_item
+            self.assertEqual(view.selected_index, idx)
+            screen_txt = "\n".join(flat_lines(view.window_rows(110, 26)))
+            self.assertIn(cur.id, screen_txt)
+
+        self.assertEqual(view.preview_cache.load_count, loads_after_down_pass)
+
     def test_14_window_resize_reflows_cjk_and_narrow_width_hides_preview(self):
         self.make_session(
             "20261028-150000-cjk123",
@@ -558,15 +612,184 @@ class TestSessionSafety(PickerTestBase):
         self.assertEqual(transcript.read_bytes(), transcript_before)
 
 
+class TestFirstMessageSearchCompleteness(PickerTestBase):
+    """Regression tests for P1: First user message search beyond 50 chars and beyond 200 preceding events."""
+
+    def test_search_keyword_after_char_50_in_chinese_and_english_while_list_display_stays_concise(self):
+        prefix = "這是一段超過五十個字元的前導背景說明文字，用來描述專案架構與模組設定細節，" * 2
+        self.assertGreater(len(prefix), 60)
+        msg_cn = prefix + "關鍵字在結尾_深層資料庫索引最佳化"
+        msg_en = prefix + "TailSearchToken_ DistributedLockManager"
+
+        self.make_session("20261028-210001-longcn", updated=1000.0, first_msg=msg_cn)
+        self.make_session("20261028-210002-longen", updated=2000.0, first_msg=msg_en)
+
+        # Store.summaries() keeps row["first"] concise (<= 50 chars) for existing callers
+        summaries = {r["id"]: r for r in Store.summaries(self.sessions_root)}
+        self.assertLessEqual(len(summaries["20261028-210001-longcn"]["first"]), 50)
+        self.assertNotIn("深層資料庫索引最佳化", summaries["20261028-210001-longcn"]["first"])
+
+        view = PickerView(self.sessions_root, str(self.work))
+        # Left list description stays concise (<= 50 chars)
+        for it in view.all_items:
+            self.assertLessEqual(len(it.first), 50)
+            self.assertLessEqual(len(it.description), 50)
+
+        # Searching by Chinese keyword after char 50 finds the exact session
+        view.set_query("深層資料庫索引最佳化")
+        self.assertEqual([it.id for it in view.filtered], ["20261028-210001-longcn"])
+
+        # Searching by case-insensitive English keyword after char 50 finds the exact session
+        view.set_query("distributedlockmanager")
+        self.assertEqual([it.id for it in view.filtered], ["20261028-210002-longen"])
+        view.set_query("TAILSEARCHTOKEN_")
+        self.assertEqual([it.id for it in view.filtered], ["20261028-210002-longen"])
+
+    def test_very_long_first_message_searchable_and_safe(self):
+        very_long = ("長篇規格說明段落 Content Block " * 500) + "ULTRA_DEEP_MARKER_8848"
+        self.assertGreater(len(very_long), 10000)
+        self.make_session("20261028-210003-verylong", updated=3000.0, first_msg=very_long)
+
+        view = PickerView(self.sessions_root, str(self.work))
+        view.set_query("ultra_deep_marker_8848")
+        self.assertEqual([it.id for it in view.filtered], ["20261028-210003-verylong"])
+        # Rendering both panes with a 10,000+ char first message never overflows or crashes
+        rows = view.window_rows(100, 24)
+        self.assertEqual(len(rows), 24)
+
+    def test_first_user_message_after_more_than_200_system_and_corrupted_events(self):
+        sdir = self.make_session("20261028-210004-late250", updated=4000.0, first_msg="")
+        # Overwrite events.jsonl with 260 system/UI events + malformed lines BEFORE the first 'Me' message
+        with open(sdir / "events.jsonl", "w", encoding="utf-8") as f:
+            for i in range(260):
+                f.write(json.dumps({"seq": i + 1, "ts": 1000.0 + i, "type": "ui", "kind": "system", "text": f"啟動檢查事件 {i}"}) + "\n")
+                if i % 50 == 0:
+                    f.write("{corrupted event line with \"Me\" and \"chat\" that is not valid JSON\n")
+            f.write(json.dumps({
+                "seq": 261,
+                "ts": 1500.0,
+                "type": "chat",
+                "sender": "Me",
+                "to": "Manager",
+                "text": ("前導文字" * 20) + "LATE_EVENT_261_搜尋目標關鍵字",
+            }, ensure_ascii=False) + "\n")
+
+        view = PickerView(self.sessions_root, str(self.work))
+        self.assertEqual(len(view.all_items), 1)
+        self.assertIn("LATE_EVENT_261_搜尋目標關鍵字", view.all_items[0].first_full)
+        view.set_query("LATE_EVENT_261_搜尋目標關鍵字")
+        self.assertEqual([it.id for it in view.filtered], ["20261028-210004-late250"])
+
+
+class TestAbnormalTimestamps(PickerTestBase):
+    """Regression tests for P1: Abnormal timestamps in _valid_ts, format_sessions, PickerView, and non-TTY agent pick."""
+
+    def test_valid_ts_and_fmt_time_reject_all_nonfinite_and_out_of_range_values(self):
+        for bad in (
+            1e400,
+            -1e400,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            10**20,
+            10**400,
+            -10**20,
+            -1.0,
+            -86400.0,
+            32503680001.0,
+            1e16,
+            None,
+            True,
+            False,
+            "1700000000",
+            "not-a-timestamp",
+            [],
+            {},
+        ):
+            self.assertIsNone(_valid_ts(bad), f"expected None for {bad!r}")
+            self.assertEqual(fmt_time(bad), "未知", f"expected '未知' for {bad!r}")
+
+        # Normal Unix timestamps succeed
+        self.assertEqual(_valid_ts(1700000000.0), 1700000000.0)
+        self.assertEqual(_valid_ts(1700000000), 1700000000.0)
+        self.assertNotEqual(fmt_time(1700000000.0), "未知")
+
+    def test_non_tty_agent_pick_and_picker_view_survive_all_abnormal_timestamps_without_modifying_files(self):
+        cases = {
+            "20261028-220001-posinf": '{"version": 3, "updated": 1e400, "agents": {"manager": {"role": "manager", "cli": "fake"}}}',
+            "20261028-220002-neginf": '{"version": 3, "updated": -1e400, "agents": {"manager": {"role": "manager", "cli": "fake"}}}',
+            "20261028-220003-nan": '{"version": 3, "updated": NaN, "agents": {"manager": {"role": "manager", "cli": "fake"}}}',
+            "20261028-220004-inf": '{"version": 3, "updated": Infinity, "agents": {"manager": {"role": "manager", "cli": "fake"}}}',
+            "20261028-220005-ninf": '{"version": 3, "updated": -Infinity, "agents": {"manager": {"role": "manager", "cli": "fake"}}}',
+            "20261028-220006-hugeint": '{"version": 3, "updated": 99999999999999999999999999999, "agents": {"manager": {"role": "manager", "cli": "fake"}}}',
+            "20261028-220007-negts": '{"version": 3, "updated": -86400, "created": -100, "agents": {"manager": {"role": "manager", "cli": "fake"}}}',
+            "20261028-220008-missing": '{"version": 3, "agents": {"manager": {"role": "manager", "cli": "fake"}}}',
+            "20261028-220009-strts": '{"version": 3, "updated": "2026-10-29", "agents": {"manager": {"role": "manager", "cli": "fake"}}}',
+            "20261028-220010-badjson": '{corrupt json',
+        }
+        snapshots = {}
+        for sid, raw_json in cases.items():
+            d = self.sessions_root / sid
+            d.mkdir()
+            (d / "state.json").write_text(raw_json, encoding="utf-8")
+            snapshots[sid] = (d / "state.json").read_bytes()
+
+        self.make_session("20261028-220099-normal", updated=1700000500.0, first_msg="正常時間戳對話")
+        before_dirs = sorted(p.name for p in self.sessions_root.iterdir())
+
+        # 1. Store.summaries() and resume.format_sessions() must not crash
+        rows = Store.summaries(self.sessions_root)
+        txt_table = resume.format_sessions(rows, limit=50)
+        self.assertIn("20261028-220099-normal", txt_table)
+        self.assertIn("20261028-220001-posinf", txt_table)
+
+        # 2. PickerView full-screen rendering across all items must not crash and shows '未知' for bad timestamps
+        view = PickerView(self.sessions_root, str(self.work))
+        self.assertEqual(view.selected_item.id, "20261028-220099-normal")  # valid timestamp sorts above None (-1.0)
+        for _ in range(len(view.filtered)):
+            screen = "\n".join(flat_lines(view.window_rows(110, 26)))
+            if view.selected_item.id != "20261028-220099-normal":
+                self.assertIn("未知", screen)
+            view.move(+1)
+
+        # 3. Non-TTY `agent pick` subprocess must exit 0, print session list, create no new session, and modify nothing
+        env = dict(
+            os.environ,
+            AGENT_HOME=str(self.home),
+            FAKE_SCENARIO=str(self.tmp / "scn.json"),
+            FAKE_STATE=str(self.fs),
+            PYTHONPATH=str(ROOT),
+        )
+        (self.tmp / "scn.json").write_text(json.dumps({"manager": [], "w1": []}), encoding="utf-8")
+        r = subprocess.run(
+            [sys.executable, "-m", "agent", "pick"],
+            input="",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            cwd=self.work,
+            timeout=30,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("20261028-220099-normal", r.stdout)
+        self.assertIn("20261028-220001-posinf", r.stdout)
+        self.assertEqual(sorted(p.name for p in self.sessions_root.iterdir()), before_dirs)
+        self.assertEqual(self.fake_calls(), [])
+        for sid, raw_bytes in snapshots.items():
+            self.assertEqual((self.sessions_root / sid / "state.json").read_bytes(), raw_bytes, sid)
+
+
 class TestPerformanceAndFallback(PickerTestBase):
     """Tests 24..28: Large session count, large history tail preview, non-TTY fallback, missing prompt_toolkit, CLI."""
 
-    def test_24_large_number_of_sessions_loads_and_filters_fast(self):
+    def test_24_large_number_of_sessions_loads_and_filters_fast_including_tail_keywords(self):
+        long_pad = "前導專案描述文字填充區塊_" * 6  # > 70 chars so suffix is past char 50
         for i in range(220):
             self.make_session(
                 f"20261028-{100000 + i:06d}-{i:06x}",
                 updated=1000.0 + i,
-                first_msg=f"大量對話測試項目編號 {i} — 處理模組 alpha_{i}",
+                first_msg=f"{long_pad}大量對話測試項目編號 {i} — 處理模組 alpha_{i}",
             )
         t0 = time.monotonic()
         view = PickerView(self.sessions_root, str(self.work))
@@ -581,6 +804,10 @@ class TestPerformanceAndFallback(PickerTestBase):
             view.window_rows(100, 24)
         filter_elapsed = time.monotonic() - t1
         self.assertLess(filter_elapsed, 1.0)
+        view.set_query("alpha_199")
+        self.assertEqual(len(view.filtered), 1)
+        self.assertIn("alpha_199", view.filtered[0].first_full)
+        self.assertLessEqual(len(view.filtered[0].first), 50)
 
     def test_25_large_history_preview_reads_tail_and_caps_at_10_items(self):
         many_events = [

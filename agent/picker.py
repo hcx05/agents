@@ -56,11 +56,15 @@ MIN_WIDTH = 16
 MIN_SPLIT_WIDTH = 68                  # below this terminal width, hide the right preview pane to keep list usable
 PREVIEW_MAX_ITEMS = 10                # limit recent chat items in preview (~10 items)
 PREVIEW_CACHE_MAX = 64                # lightweight LRU cache cap for session previews
+FIRST_MSG_CACHE_MAX = 512             # lightweight LRU cache cap for full first user messages
 TAIL_INITIAL_BYTES = 65536            # 64 KB initial tail read for large events.jsonl
 TAIL_MAX_BYTES = 524288               # 512 KB cap when searching tail for recent chat items
 
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+
+_FIRST_MSG_CACHE: "OrderedDict[str, Tuple[Tuple[int, int], str]]" = OrderedDict()
+_FIRST_MSG_LOCK = threading.RLock()
 
 
 def _char_width(ch: str) -> int:
@@ -146,14 +150,35 @@ def wrap(text: str, width: int) -> List[str]:
     return rows
 
 
-def fmt_time(ts: Optional[float], with_seconds: bool = False) -> str:
-    if ts is None:
+def fmt_time(ts: Any, with_seconds: bool = False) -> str:
+    valid = _valid_ts(ts)
+    if valid is None:
         return "未知"
+    fmt = "%Y-%m-%d %H:%M:%S" if with_seconds else "%Y-%m-%d %H:%M"
+    return time.strftime(fmt, time.localtime(valid))
+
+
+def _cached_first_user_message(session_dir: Path) -> str:
+    """Return the full first user ('Me') message for `session_dir`, cached by events.jsonl (mtime_ns, size)."""
+    events_path = Path(session_dir) / "events.jsonl"
     try:
-        fmt = "%Y-%m-%d %H:%M:%S" if with_seconds else "%Y-%m-%d %H:%M"
-        return time.strftime(fmt, time.localtime(float(ts)))
-    except (OSError, OverflowError, ValueError, TypeError):
-        return "未知"
+        st = events_path.stat()
+        sig = (int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), int(st.st_size))
+    except OSError:
+        return ""
+    key = str(events_path)
+    with _FIRST_MSG_LOCK:
+        cached = _FIRST_MSG_CACHE.get(key)
+        if cached is not None and cached[0] == sig:
+            _FIRST_MSG_CACHE.move_to_end(key)
+            return cached[1]
+    msg = sanitize(Store.first_user_message(session_dir)).replace("\n", " ").strip()
+    with _FIRST_MSG_LOCK:
+        _FIRST_MSG_CACHE[key] = (sig, msg)
+        _FIRST_MSG_CACHE.move_to_end(key)
+        while len(_FIRST_MSG_CACHE) > FIRST_MSG_CACHE_MAX:
+            _FIRST_MSG_CACHE.popitem(last=False)
+    return msg
 
 
 @dataclass
@@ -176,15 +201,22 @@ class SessionItem:
     agents: str = "?"
     agents_detail: str = "?"
     locked: bool = False
-    first: str = ""
+    first: str = ""                     # concise display summary (<= 50 chars)
+    first_full: str = ""                # full first user message for search & preview
     import_source: Optional[str] = None
     import_fork: Optional[str] = None
     import_stage: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        if not self.first_full and self.first:
+            self.first_full = self.first
+
     @property
     def description(self) -> str:
         if self.first:
-            return one_line(self.first, 100)
+            return one_line(self.first, 50)
+        if self.first_full:
+            return one_line(self.first_full[:50], 50)
         if not self.ok:
             return f"[損壞] {one_line(self.error or 'state.json 異常', 60)}"
         if self.import_source:
@@ -222,7 +254,8 @@ def _inspect_session_state(session_dir: Path, row: Dict[str, Any], current_cwd: 
     """Read-only validation and enrichment of one session's metadata from state.json."""
     sid = str(row.get("id") or session_dir.name)
     locked = bool(row.get("locked", False))
-    first = sanitize(row.get("first") or "").replace("\n", " ").strip()
+    first_full = _cached_first_user_message(session_dir)
+    first_short = sanitize(row.get("first") or first_full[:50]).replace("\n", " ").strip()[:50]
     state_path = session_dir / "state.json"
 
     ok = True
@@ -247,7 +280,7 @@ def _inspect_session_state(session_dir: Path, row: Dict[str, Any], current_cwd: 
         return SessionItem(
             id=sid, ok=False, error=f"state.json 無法解析 ({e})", version=None, created=created, updated=updated,
             cwd=cwd, cwd_mismatch=False, state="unreadable", agents="?", agents_detail="?", locked=locked,
-            first=first, import_source=import_source,
+            first=first_short, first_full=first_full, import_source=import_source,
         )
 
     ver = st.get("version", 1)
@@ -257,8 +290,12 @@ def _inspect_session_state(session_dir: Path, row: Dict[str, Any], current_cwd: 
     else:
         version = ver
 
-    created = _valid_ts(st.get("created")) if _valid_ts(st.get("created")) is not None else created
-    updated = _valid_ts(st.get("updated")) or created
+    created_st = _valid_ts(st.get("created"))
+    if created_st is not None:
+        created = created_st
+    updated_st = _valid_ts(st.get("updated"))
+    updated = updated_st if updated_st is not None else created
+
     cwd_val = st.get("cwd")
     if cwd_val is not None and not isinstance(cwd_val, str):
         ok = False
@@ -315,7 +352,8 @@ def _inspect_session_state(session_dir: Path, row: Dict[str, Any], current_cwd: 
     return SessionItem(
         id=sid, ok=ok, error=error, version=version, created=created, updated=updated, cwd=cwd,
         cwd_mismatch=cwd_mismatch, state=state_str, agents=agents_short, agents_detail=agents_detail,
-        locked=locked, first=first, import_source=import_source, import_fork=import_fork, import_stage=import_stage,
+        locked=locked, first=first_short, first_full=first_full, import_source=import_source,
+        import_fork=import_fork, import_stage=import_stage,
     )
 
 
@@ -338,7 +376,7 @@ def load_session_items(sessions_root: Path, current_cwd: Optional[str] = None) -
         except StoreError:
             continue
         items.append(_inspect_session_state(sdir, row, current_cwd))
-    items.sort(key=lambda it: (it.updated if it.updated is not None else -1.0, it.id), reverse=True)
+    items.sort(key=lambda it: (_valid_ts(it.updated) if _valid_ts(it.updated) is not None else -1.0, it.id), reverse=True)
     return items
 
 
@@ -352,9 +390,10 @@ def _is_subsequence(needle: str, haystack: str) -> bool:
 
 def _match_score(item: SessionItem, tokens: List[str]) -> Optional[Tuple[int, float, str]]:
     """Return a sort key `(tier, -updated, id)` when all query tokens match `item`, or None if not matched.
-    tier 0: exact substring match in primary fields; tier 1: lightweight fuzzy subsequence match."""
+    tier 0: exact substring match in primary fields (including full first user message);
+    tier 1: lightweight fuzzy subsequence match."""
     id_low = item.id.lower()
-    first_low = (item.first or "").lower()
+    first_full_low = (item.first_full or item.first or "").lower()
     cwd_low = (item.cwd or "").lower()
     cwd_base = os.path.basename(cwd_low.rstrip("/\\"))
     desc_low = " ".join([
@@ -367,22 +406,25 @@ def _match_score(item: SessionItem, tokens: List[str]) -> Optional[Tuple[int, fl
         "damaged 損壞 error unreadable" if not item.ok else "",
         "import 匯入 claude" if item.import_source else "",
     ])
-    haystack_all = f"{id_low}\n{first_low}\n{cwd_low}\n{desc_low}"
+    haystack_all = f"{id_low}\n{first_full_low}\n{cwd_low}\n{desc_low}"
 
     worst_tier = 0
     for tok in tokens:
         if tok in haystack_all:
             continue
-        if len(tok) >= 2 and (_is_subsequence(tok, id_low) or _is_subsequence(tok, cwd_base) or _is_subsequence(tok, first_low)):
+        if len(tok) >= 2 and (
+            _is_subsequence(tok, id_low) or _is_subsequence(tok, cwd_base) or _is_subsequence(tok, first_full_low)
+        ):
             worst_tier = max(worst_tier, 1)
         else:
             return None
-    upd = item.updated if item.updated is not None else -1.0
-    return (worst_tier, -upd, item.id)
+    upd = _valid_ts(item.updated)
+    upd_sort = upd if upd is not None else -1.0
+    return (worst_tier, -upd_sort, item.id)
 
 
 def filter_sessions(items: Sequence[SessionItem], query: str) -> List[SessionItem]:
-    """Filter sessions by query (ID, working folder, first user message, status/description).
+    """Filter sessions by query (ID, working folder, full first user message, status/description).
     Case-insensitive for English, supports Chinese and multi-token search, keeps newest-updated order."""
     q = sanitize(query).strip().lower()
     if not q:
@@ -448,16 +490,6 @@ def read_recent_timeline(session_dir: Path, limit: int = PREVIEW_MAX_ITEMS) -> T
         return [], False
 
 
-def _read_first_message_fallback(session_dir: Path, max_lines: int = 200) -> str:
-    """Read-only scan of the beginning of events.jsonl for the first user ('Me') chat message."""
-    for idx, rec in enumerate(Store.iter_events(session_dir)):
-        if idx >= max_lines:
-            break
-        if rec.get("type") == "chat" and rec.get("sender") == "Me":
-            return sanitize(rec.get("text", "")).replace("\n", " ").strip()[:120]
-    return ""
-
-
 class PreviewCache:
     """Lightweight read-only LRU cache for session previews. Loads on demand only for the selected session."""
 
@@ -472,7 +504,7 @@ class PreviewCache:
         try:
             sdir = safe_session_dir(self.sessions_root, item.id)
         except StoreError as e:
-            return PreviewData(item=item, first_message=item.first, recent_items=[], error=str(e))
+            return PreviewData(item=item, first_message=item.first_full or item.first, recent_items=[], error=str(e))
 
         events_path = sdir / "events.jsonl"
         try:
@@ -489,7 +521,7 @@ class PreviewCache:
             return preview
 
         self.load_count += 1
-        first_msg = item.first or _read_first_message_fallback(sdir)
+        first_msg = item.first_full or item.first or _cached_first_user_message(sdir)
         recent, omitted = read_recent_timeline(sdir, limit=self.max_items)
         preview = PreviewData(
             item=item,
@@ -786,7 +818,7 @@ class PickerView:
         lock_txt = "是 [LOCKED / 其他程序使用中]" if sel.locked else "否"
         add_kv("鎖定狀態  ", lock_txt, "class:error" if sel.locked else "")
 
-        first_msg = preview.first_message or sel.first or "(無)"
+        first_msg = preview.first_message or sel.first_full or sel.first or "(無)"
         add_kv("首則訊息  ", first_msg, "class:me" if first_msg != "(無)" else "class:replay")
 
         rows.append([("class:border", "-" * width)])
