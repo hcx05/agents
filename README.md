@@ -48,7 +48,7 @@ agent                           # 全螢幕；agent --plain 強制簡易模式�
 ```
 
 - **單一聊天室**：上方是依時間排序的對話（我→Manager、Manager 回覆、Manager→Worker 派工、Worker→Manager 回報、最終答覆、系統提示與錯誤），
-  每則標明來源與該回合的模型（CLI 回報／僅要求／未知）。沒有分割視窗、側欄或分頁。純文字、依顯示寬度換行（中文佔 2 格），視窗縮放後自動重排。
+  每則有標頭（見下方「畫面樣式」）。沒有分割視窗、側欄或分頁。純文字、依顯示寬度換行（中文佔 2 格），視窗縮放後自動重排。
 - **固定在底部的輸入框**，上方一行標明「Agent 聊天室（輸入送給 Manager，不是 PowerShell）」。Agent 工作時可繼續輸入，新訊息不會動到你正在打的字。
 - 按鍵：`Enter` 送出；`Ctrl+J`（或 `Alt+Enter`）換行，**不依賴 Shift+Enter**；`PgUp` / `PgDn` 捲動歷史；`End`（輸入框空白時）或 `Ctrl+End` 回到最新；
   `Ctrl+C` 在有工作進行時等同 `/interrupt`，否則清除輸入框草稿；`Ctrl+D`（輸入框空白）離開；`/exit` 離開。貼上多行文字不會觸發送出。
@@ -59,12 +59,42 @@ agent                           # 全螢幕；agent --plain 強制簡易模式�
   不讀 Manager／Worker／系統訊息、原始輸出或 Claude 原生紀錄），`--replay 0` 只是不重播畫面，仍可按 `Up`。斜線指令只在同一次執行中可回溯，resume 後不會恢復。
   不會建立任何新檔案，也不跨 Session。
 - 往上讀歷史時，新訊息**不會把畫面拉走**；狀態列會顯示「捲動中，N 則新訊息；End 回到最新」。送出訊息會自動回到最新。
-- **狀態列**（輸入框上方）：各 Agent 閒置／執行中、已執行時間、多久沒有新輸出、進行中的任務、佇列數，以及「等你回答」「已暫停」「Manager 等待 Worker」。
+- **狀態列**（輸入框上方，`● Mgr 執行中 8s · 工具 Read    ○ w1 閒置`）：各 Agent 閒置／執行中、已執行時間、多久沒有新輸出、進行中的任務、佇列數，以及「等你回答」「已暫停」「Manager 等待 Worker」。
+  視窗變窄時依固定優先順序降級：先去掉「多久沒有輸出」與工具經過時間，再去掉工具／任務／佇列，再只留「名稱＋執行中時間」，最後只留符號與名稱、隱藏閒置的 Agent；
+  「捲動中」「已暫停」「等你回答」最後才會被截掉。
   只顯示 Engine 真正知道的事：Claude 回報的工具**名稱**（不含參數）才會出現，agy 與其他 CLI 不會有；**不會有**進度百分比、token 數或編造的動作。
   過程中的工具事件不會變成聊天訊息。
-- **重播（resume）**：先前的對話以暗色並在左側加 `| ` 標示，前後有「以下是先前的對話／到此為止」分隔，唯讀、不呼叫模型、不重複寫入紀錄；`--replay 0` 完全不顯示。
+- **重播（resume）**：先前的對話以暗色並在左側加一條直線（ASCII 模式為 `| `）標示，前後有「以下是先前的對話／到此為止」分隔，唯讀、不呼叫模型、不重複寫入紀錄；`--replay 0` 完全不顯示。
   原生 Claude Session 的歷史永遠不會被當成 Agent 聊天顯示。
 - 離開後回到一般終端機並印出 `Bye. Session saved … (resume with: agent resume <id>)`。畫面層出錯不會動到已保存的 Session（`finally` 仍會關閉 Engine、放掉鎖）。
+
+#### 畫面樣式
+
+```text
+  › You · 14:31
+    請檢查這個專案的測試結果。
+
+  ◆ Claude Sonnet 5.5 (Mgr) · → w1 · 14:31
+    我會請 w1 執行測試。
+
+  · 已指派任務 t1 給 w1
+
+  ◇ Antigravity (w1) · 模型未知 · 14:32
+    測試已完成，發現兩個問題。
+```
+
+- **角色**：`›` 你、`◆` Manager（青藍色）、`◇` Worker（綠／紫／金，依 Worker 名稱固定）、`·` 系統（暗灰、緊湊不空行）、`!` 錯誤（紅）、`●` 執行中、`○` 閒置。
+  訊息之間空一行，連續的系統訊息不空行；時間（`HH:MM`）暗色；重播的舊訊息不顯示時間。
+- **模型名稱**只來自這個 turn 的證據，三級不混用：`Claude Sonnet 5.5 (Mgr)`＝CLI **回報**；`Gemini 3 Flash (w1) · 未確認`＝只是**要求**使用、CLI 沒確認；
+  `Antigravity (w2) · 模型未知`＝沒有任何證據，只顯示 CLI 名稱，**不猜**（agy 可用模型清單也不會被當成目前模型）。`claude-sonnet-5-5` → `Claude Sonnet 5.5`、
+  `gemini-3-flash` → `Gemini 3 Flash` 只是改寫已知格式的拼法；不認得的 ID 原樣顯示；過長會以 `...` 截短。視窗太窄時先隱藏時間、再隱藏「→ 收件者」，最後才縮短名稱，「未確認／模型未知」不會被丟掉。
+  完整的證據（要求值、回報值、`models` 清單）仍在 `/status` 與 `events.jsonl`。
+- **符號相容**：裝飾符號（`› ◆ ◇ · ● ○ → │`）在傳統 Windows 主控台（尤其中文系統）可能被畫成 2 格寬或缺字而錯位，所以預設是保守的：
+  Windows 只有在 Windows Terminal（`WT_SESSION`）或 VS Code 終端機才用 Unicode，**傳統 PowerShell／cmd 視窗預設用 ASCII 符號**（`> * + - o`）；
+  Linux／macOS 在 UTF-8 且 `TERM` 不是 `dumb`／`linux` 時用 Unicode。`WT_SESSION` 只是線索，不保證字型有這些符號——看到錯位就強制 ASCII：
+  `agent --symbols ascii`（或環境變數 `AGENT_SYMBOLS=ascii`；想強制開啟用 `unicode`；預設 `auto`）。訊息文字本身不依賴這些符號。
+- **顏色**：由 `prompt_toolkit` 偵測終端機能力——真彩色／256 色用低飽和度配色；16 色終端機改用 ANSI 色名（跟著你的終端機配色）；`NO_COLOR` 或單色終端機只剩粗體／暗色區別。
+  深色背景為預設；淺色背景請設 `AGENT_THEME=light`（若終端機有設定 `COLORFGBG` 則自動判斷）。不需安裝額外套件。
 
 ### 恢復對話：`agent sessions` / `agent resume <id>`
 
@@ -165,7 +195,7 @@ py probe.py claude --tests fork-chosen-interactive --session-id <ID> --confirm-f
 
 ### 每則回覆的模型
 
-每個 Agent 回覆前會在聊天室標一行 `Manager · claude · <模型>（CLI 回報）`，只在該 Agent 的模型變動時再出現。三種意義不同：**CLI 回報**（CLI 在這個 turn 的事件裡明說用了什麼）／**要求使用 X（CLI 未確認）**（我們傳了 `--model`，但 CLI 沒回報）／**模型未知**。要求的模型不會被當成實際模型；每個 turn 各自記錄（`events.jsonl` 的 `chat.turn`），之後改設定不會改寫歷史。agy 目前沒有已確認的模型欄位，所以通常顯示「要求使用」或「未知」。
+全螢幕聊天室的每則回覆標頭直接帶模型名稱（見「畫面樣式」）；簡易模式與 `events.jsonl` 則在回覆前標一行 `Manager · claude · <模型>（CLI 回報）`，只在該 Agent 的模型變動時再出現。三種意義不同：**CLI 回報**（CLI 在這個 turn 的事件裡明說用了什麼）／**要求使用 X（CLI 未確認）**（我們傳了 `--model`，但 CLI 沒回報）／**模型未知**。要求的模型不會被當成實際模型；每個 turn 各自記錄（`events.jsonl` 的 `chat.turn`），之後改設定不會改寫歷史。agy 目前沒有已確認的模型欄位，所以通常顯示「要求使用」或「未知」。
 
 ### 設定檔 `%APPDATA%\agent\config.json`
 
@@ -237,8 +267,10 @@ Ctrl+Break/taskkill 清理（agy 另測 `--conversation`/`--json-schema` 是否�
 | **Windows 原生**（subprocess、`.cmd` shim、Ctrl+Break/taskkill、主控台 UTF-8/ANSI） | **尚未實測**，程式已依 Windows 行為撰寫，請跑 `probe.py` |
 | **agy 1.4.9** 官方 `init→step_update→result` 解析、`--effort` 傳遞、`--conversation` 一致性防護 | 僅以官方格式的模擬事件與 `tests/fake_agy.py` 測試；**未用真實 agy 驗證** |
 | agy `--conversation` ＋ stdin streaming、`--json-schema`、soft-denial 實際文字、Windows 行為 | **尚未實測**，請跑 `py probe.py agy` |
-| 全螢幕聊天室（`prompt_toolkit`）：Linux pseudo terminal＋腳本化按鍵（中文、`Ctrl+J`、括號貼上、捲動、背景訊息、重播、`/exit` 清理、非 TTY 退回簡易模式） | 通過 |
-| **全螢幕聊天室在 Windows 實機**（IME、貼上、縮放、按鍵辨識） | **尚未實測**，見上節手動驗收 |
+| 全螢幕聊天室（`prompt_toolkit`）：Linux pseudo terminal＋腳本化按鍵（中文、`Ctrl+J`、括號貼上、捲動、背景訊息、重播、`/exit` 清理、非 TTY 退回簡易模式） | Batch 3 當時通過；Batch 3C 之後**未在 Linux 重跑**（本機沒有 Linux 環境） |
+| 全螢幕聊天室在 **Windows 真實主控台（ConPTY，`tests/conpty.py`）**＋Fake CLI：中文輸入、`Ctrl+J`、Manager→Worker→Manager、`Up` 歷史、縮放（120→40→120 欄）、`resume` 重播、`--replay 0`、`--symbols ascii`、`/exit` 與 Session Lock 釋放 | 通過（`py -m unittest tests.test_tui`） |
+| 同上，真實 Claude Code（Manager）＋真實 agy（`w1`）各跑一小段：標頭顯示 `Claude Sonnet 5.5 (Mgr)`（CLI 回報）與 `Antigravity (w1) · 模型未知` | 通過（手動煙霧測試，隔離的 `AGENT_HOME`） |
+| **Windows IME 組字、Windows Terminal 與傳統主控台的實際字型／字元寬度、淺色背景實際觀感** | **尚未驗證**（無法自動化，需目視），見下節手動驗收 |
 | Codex、多 Worker、`/resume` | 依規格不做 |
 
 ### 全螢幕聊天室的 Windows 手動驗收（PowerShell）
@@ -257,12 +289,14 @@ agent                                  # 1. 應進入全螢幕；底部輸入框
 4. `PgUp` 往上看歷史；工作中新訊息到達時畫面不會被拉到底部，狀態列提示新訊息數；按 `End` 回到最新。
 5. 拖動視窗改變大小、縮得很窄／放很寬：文字依寬度重排，中英混排與長行不超出邊界、不殘影。
 6. 工作進行中按 `Ctrl+C`：等同 `/interrupt`；之後 `/status` 正常，`/exit` 離開並回到一般 PowerShell 提示字元。
-7. `agent sessions`，再 `agent resume <id>`：先前對話為暗色、左側有 `| `，標明唯讀；沒有任何模型被呼叫。`agent resume <id> --replay 0` 不顯示歷史。
+7. `agent sessions`，再 `agent resume <id>`：先前對話為暗色、左側有一條直線（或 `| `），標明唯讀；沒有任何模型被呼叫。`agent resume <id> --replay 0` 不顯示歷史。
 8. `agent --plain` 以及 `"/exit" | agent`（管線）都是原本的簡易模式。`py -m pip uninstall prompt_toolkit` 後執行 `agent`：stderr 提示安裝方式並退回簡易模式。
 9. 匯入：`agent <Claude UUID>` 的確認流程與之前相同；進入全螢幕後第一則訊息才建立 Fork。
 10. 輸入歷史（Batch 3B）：依序送出 `你好`、`第二則`、`第三則`；按三次 `Up` 依序出現 第三則、第二則、你好，再按 `Down` 往回；打一半的草稿在 `Up` 後再 `Down` 回到最新時要還原；
     多行草稿（`Ctrl+J`）內 `Up` 先移動游標、到第一行才換歷史；`Ctrl+P` / `Ctrl+N` 直接換筆；選到 `/status` 時只是出現在輸入框，要按 `Enter` 才會執行；
     `/exit` 後 `agent resume <id>`（以及加 `--replay 0`）按 `Up` 應取回先前送出的訊息，且不會自動送出、不產生新的對話或 turn。
+11. 視覺（Batch 3C）：在 Windows Terminal 與傳統 PowerShell 視窗各看一次——標頭 `›`／`◆`／`◇`（或 ASCII 的 `>`／`*`／`+`）與文字對齊、中文不錯位、右邊界沒有被擠到下一行；
+    狀態列縮窄視窗時依序降級、不換行；用 `agent --symbols unicode`／`--symbols ascii` 與 `AGENT_THEME=light` 各試一次（淺色背景的可讀性只能目視確認）；縮放視窗後沒有殘影。
 
 ## 已知限制
 
@@ -271,7 +305,8 @@ agent                                  # 1. 應進入全螢幕；底部輸入框
 - 同時有 Manager 與 Worker 在跑時，檔案快照無法區分是誰改的。
 - `timeout` 是每個 turn 的總時間上限（`turn_timeout_sec`）。另有純提示用的「無輸出」提醒（`silence_warn_sec` 預設 60 秒、之後每 `silence_repeat_sec` 預設 300 秒最多一次，有新輸出即重算）；它不會中斷任務，也不代表模型正在「思考」，只表示 CLI 沒有新輸出。
 - 簡易行模式（`--plain`、非終端機）在等待輸入時若有非同步訊息插入，「正在輸入的文字」會暫時被清掉重畫提示列（文字仍在輸入緩衝區，按 Enter 照常送出）；全螢幕模式沒有這個問題。
-- 全螢幕聊天室：中文輸入法（IME）組字、Windows Terminal 的貼上、視窗縮放、`Ctrl+J` 辨識，目前只在 Linux 的 pseudo terminal 與腳本化輸入下測過，**Windows 實機尚未驗證**（見下節的手動驗收步驟）。
-  畫面結構只用 ASCII 符號（避免 CJK 主控台把「模稜兩可寬度」符號畫成 2 格造成右邊界錯位）。不支援滑鼠、不渲染 Markdown。
+- 全螢幕聊天室：中文輸入法（IME）組字、Windows Terminal 的貼上、視窗縮放、`Ctrl+J` 辨識，已在 Windows ConPTY 與腳本化輸入下測過，**IME 組字與實際字型寬度尚未目視驗證**（見下節的手動驗收步驟）。
+  Unicode 符號是否對齊取決於終端機與字型，自動選擇是保守的啟發式（見「符號相容」），不保證；錯位時請用 `--symbols ascii`。不支援滑鼠、不渲染 Markdown。
+- 尚未做：Thinking／工具活動摺疊（Claude `-p` 模式的思考文字可能是空的，不會編造）、agy 目前模型偵測（目前 agy 多半顯示「模型未知」）。
 - 啟動時會在背景用官方 `--version` 記錄 CLI 版本（不耗額度、失敗不影響使用）；版本是否「已測試」見 `/status`，清單在 `agent/compat.py`，且不等於完全相容。
 - 中斷後，被中斷的 CLI Session 可能留有半截歷史；程式會告知 Manager「任務被中斷、檔案未還原」。

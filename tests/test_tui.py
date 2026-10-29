@@ -154,22 +154,26 @@ class TestEntriesAndStatus(unittest.TestCase):
     def test_sources_are_distinguishable_and_model_label_is_kept(self):
         v = ChatView()
         ui = TuiUI(v, lambda: None)
-        meta = {"source": "reported", "reported": "claude-x", "models": ["claude-x"]}
+        rep = {"agent": "manager", "cli": "claude", "source": "reported", "reported": "claude-sonnet-5-5",
+               "models": ["claude-sonnet-5-5"]}
         ui.echo_me("你好")
-        ui.chat("Manager", "派工", "Worker", meta)
-        ui.chat("Worker", "回報", "Manager", {"source": "unknown"})
+        ui.chat("Manager", "派工", "w1", rep)
+        ui.chat("w1", "回報", "Manager", {"agent": "w1", "cli": "agy", "source": "unknown"})
+        ui.chat("w2", "要求", None, {"agent": "w2", "cli": "agy", "source": "requested", "requested": "gemini-3-flash"})
         ui.system("activity")
         ui.error("boom")
         ui.ask_user("要選哪個？")
         rows = texts(v.window_rows(100, 60))
-        self.assertTrue(any(r.endswith("Me -> Manager") for r in rows), rows)
-        self.assertTrue(any("Manager -> Worker" in r and "claude-x（CLI 回報）" in r for r in rows))
-        self.assertTrue(any("Worker -> Manager" in r and "模型未知" in r for r in rows))
-        self.assertTrue(any(r.startswith("* activity") for r in rows))
-        self.assertTrue(any(r.startswith("! boom") for r in rows))
-        self.assertTrue(any("[需要你的回答]" in r for r in rows))
-        me = [r for r in rows if r.endswith("Me -> Manager")]
+        self.assertTrue(any(r.startswith("  › You") for r in rows), rows)
+        self.assertTrue(any("◆ Claude Sonnet 5.5 (Mgr)" in r and "→ w1" in r for r in rows), rows)
+        self.assertTrue(any("◇ Antigravity (w1) · 模型未知" in r for r in rows), rows)
+        self.assertTrue(any("◇ Gemini 3 Flash (w2) · 未確認" in r for r in rows), rows)
+        self.assertTrue(any(r.startswith("  · activity") for r in rows))
+        self.assertTrue(any(r.startswith("  ! boom") for r in rows))
+        self.assertTrue(any("需要你的回答" in r for r in rows))
+        me = [r for r in rows if r.startswith("  › You")]
         self.assertNotIn("(", me[0])               # the user's own line carries no model label
+        self.assertNotIn("未確認", "".join(r for r in rows if "Claude Sonnet" in r))   # reported needs no caveat
 
     def test_title_line_always_says_what_the_box_is_and_fits(self):
         for cols in (30, 50, 70, 90, 140):
@@ -193,10 +197,11 @@ class TestEntriesAndStatus(unittest.TestCase):
         r.error("old error")
         ui.chat("Manager", "新訊息", None)
         rows = texts(v.window_rows(80, 40))
-        old = [x for x in rows if "舊訊息" in x or "old error" in x or "Me -> Manager" in x]
-        self.assertTrue(old and all(x.startswith("| ") for x in old), old)
+        old = [x for x in rows if "舊訊息" in x or "old error" in x or "You" in x]
+        self.assertTrue(old and all(x.startswith("│ ") for x in old), old)
+        self.assertFalse(any(":" in x for x in old if "You" in x))      # no clock on replayed items
         new = [x for x in rows if "新訊息" in x]
-        self.assertFalse(new[0].startswith("| "))
+        self.assertFalse(new[0].startswith("│ "))
         self.assertTrue(all(e.replay for e in v.entries[:3]))
         self.assertFalse(v.entries[3].replay)
 
@@ -208,11 +213,11 @@ class TestEntriesAndStatus(unittest.TestCase):
                            {"name": "Worker", "running": False, "elapsed": None, "quiet": None, "tool": None,
                             "tool_ago": None, "task": None, "queued": 0}]}
         s = status_line(snap, v)
-        self.assertIn("Manager 執行中 1m15s", s)
+        self.assertIn("● Mgr 執行中 1m15s", s)
         self.assertIn("12 秒沒有輸出", s)
         self.assertIn("工具 Read", s)
-        self.assertIn("（佇列 1）", s)
-        self.assertIn("Worker 閒置", s)
+        self.assertIn("佇列 1", s)
+        self.assertIn("○ Worker 閒置", s)
         self.assertNotIn("%", s)
         snap["agents"][0]["tool"] = None
         self.assertNotIn("工具", status_line(snap, v))
@@ -240,7 +245,7 @@ class TestEntriesAndStatus(unittest.TestCase):
         self.assertIn("員工 w1 執行中 1s", s)
         self.assertIn("工具 mcp__fs__read_file-2.0", s)
         self.assertIn("任務 任務-A_1.2", s)
-        self.assertIn("（佇列 2）", s)
+        self.assertIn("佇列 2", s)
 
     def test_long_dynamic_values_are_capped_and_none_is_not_shown(self):
         snap = {"agents": [{"name": "x" * 500, "running": True, "elapsed": 1.0, "quiet": 0, "tool": "y" * 500,
@@ -729,92 +734,154 @@ class TestNonTtyStaysPlain(Base):
         self.assertIn("Bye. Session saved", r.stdout)
 
 
-@unittest.skipUnless(HAVE_PTK and os.name == "posix", "needs prompt_toolkit and a POSIX pseudo terminal")
-class TestWholeRunInAPty(Base):
-    """`python -m agent` on a pseudo terminal: full screen, Chinese + multi-line input, Manager -> Worker -> Manager,
-    /exit cleanup, then `resume` with replay (which must not call any model)."""
-
-    def spawn(self, args, scenario):
+class _PosixTerm:
+    def __init__(self, args, env, cwd):
         import fcntl
         import pty
         import struct
         import termios
-        master, slave = pty.openpty()
+        self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
-        proc = subprocess.Popen([sys.executable, "-m", "agent"] + args, stdin=slave, stdout=slave, stderr=slave,
-                                env=self.env(scenario), cwd=self.work, close_fds=True, start_new_session=True)
+        self.proc = subprocess.Popen([sys.executable, "-m", "agent"] + args, stdin=slave, stdout=slave, stderr=slave,
+                                     env=env, cwd=cwd, close_fds=True, start_new_session=True)
         os.close(slave)
-        buf = bytearray()
-        stop = threading.Event()
+        self.buf = bytearray()
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._pump, daemon=True)
+        self._t.start()
 
-        def pump():
-            import select
-            while not stop.is_set():
-                r, _, _ = select.select([master], [], [], 0.1)
-                if r:
-                    try:
-                        d = os.read(master, 65536)
-                    except OSError:
-                        return
-                    if not d:
-                        return
-                    buf.extend(d)
-        t = threading.Thread(target=pump, daemon=True)
-        t.start()
+    def _pump(self):
+        import select
+        while not self._stop.is_set():
+            r, _, _ = select.select([self.master], [], [], 0.1)
+            if r:
+                try:
+                    d = os.read(self.master, 65536)
+                except OSError:
+                    return
+                if not d:
+                    return
+                self.buf.extend(d)
 
-        def close():
-            stop.set()
-            t.join(2)
-            os.close(master)
-        return proc, master, buf, close
+    def write(self, data):
+        os.write(self.master, data if isinstance(data, bytes) else data.encode("utf-8"))
+
+    def wait(self, t):
+        return self.proc.wait(t)
+
+    def poll(self):
+        return self.proc.poll()
+
+    def kill(self):
+        self.proc.kill()
+
+    def close(self):
+        self._stop.set()
+        self._t.join(2)
+        os.close(self.master)
+
+
+class _WinTerm:
+    """A real Windows pseudo console (ConPTY): the child sees a console, so the Win32/VT code paths run for real."""
+
+    def __init__(self, args, env, cwd):
+        from tests.conpty import ConPty
+        self.pty = ConPty([sys.executable, "-m", "agent"] + args, env, cwd)
+        self.buf = self.pty.buf
+
+    def write(self, data):
+        self.pty.write(data)
+
+    def wait(self, t):
+        return self.pty.wait(t)
+
+    def poll(self):
+        return self.pty.poll()
+
+    def kill(self):
+        self.pty.kill()
+
+    def close(self):
+        self.pty.close()
+
+
+@unittest.skipUnless(HAVE_PTK, "needs prompt_toolkit")
+class TestWholeRunInAPty(Base):
+    """`python -m agent` on a pseudo terminal (POSIX pty, or ConPTY on Windows): full screen, Chinese + multi-line
+    input, Manager -> Worker -> Manager, /exit cleanup, then `resume` with replay (which must not call any model)."""
+
+    def spawn(self, args, scenario, **extra_env):
+        env = self.env(scenario)
+        for k in ("WT_SESSION", "TERM_PROGRAM", "AGENT_SYMBOLS", "AGENT_THEME", "NO_COLOR"):
+            env.pop(k, None)                 # the developer's own terminal must not decide what the test sees
+        env.update(extra_env)
+        term = (_WinTerm if os.name == "nt" else _PosixTerm)(args, env, self.work)
+        self.addCleanup(term.close)
+        return term
+
+    ALT_OFF = b"[?1049l"
+
+    @staticmethod
+    def ready(term):
+        """The full-screen app has painted its input box (ConPTY swallows the alternate-screen switch, so this is the
+        marker that works on both kinds of terminal)."""
+        return "Agent 聊天室".encode() in term.buf
 
     def test_full_flow_then_resume(self):
         scn = {"manager": [M([dispatch("w1", "t1", "do it")]), M([final("全部完成")])],
                "w1": [W("done", "t1", "worker 報告")]}
-        proc, master, buf, close = self.spawn([], scn)
-        try:
-            self.assertTrue(until(lambda: b"\x1b[?1049h" in buf, 20), bytes(buf[-300:]))      # alternate screen entered
-            time.sleep(0.5)
-            os.write(master, "你好\x0a第二行\r".encode("utf-8"))
-            sess = None
+        term = self.spawn([], scn, WT_SESSION="test")
+        self.assertTrue(until(lambda: self.ready(term), 30), bytes(term.buf[-300:]))      # alternate screen entered
+        time.sleep(0.8)
+        term.write("你好\x0a第二行\r")
+        sess = None
 
-            def done():
-                nonlocal sess
-                try:
-                    sess, ev = self.events()
-                except Exception:
-                    return False
-                return any(e.get("type") == "chat" and "全部完成" in str(e.get("text")) for e in ev)
-            self.assertTrue(until(done, 60), bytes(buf[-500:]))
-            sess, ev = self.events()
-            chat = [(e["sender"], e.get("to"), e["text"]) for e in ev if e.get("type") == "chat"]
-            self.assertEqual(chat[0], ("Me", "Manager", "你好\n第二行"))                 # newline kept, ONE message
-            self.assertIn("Worker", " ".join(s for s, _, _ in chat) + " Worker")
-            os.write(master, b"/exit\r")
-            self.assertEqual(proc.wait(30), 0, bytes(buf[-500:]))
-            self.assertIn(b"\x1b[?1049l", buf)                                              # alternate screen left
-            self.assertIn("Bye. Session saved".encode(), bytes(buf))
-            self.assertFalse((sess / "session.lock").exists() and self._locked(sess), "lock released")
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-            close()
+        def done():
+            nonlocal sess
+            try:
+                sess, ev = self.events()
+            except Exception:
+                return False
+            return any(e.get("type") == "chat" and "全部完成" in str(e.get("text")) for e in ev)
+        self.assertTrue(until(done, 60), bytes(term.buf[-500:]))
+        sess, ev = self.events()
+        chat = [(e["sender"], e.get("to"), e["text"]) for e in ev if e.get("type") == "chat"]
+        self.assertEqual(chat[0], ("Me", "Manager", "你好\n第二行"))                 # newline kept, ONE message
+        self.assertIn("Worker", " ".join(s for s, _, _ in chat) + " Worker")
+        shown = bytes(term.buf).decode("utf-8", "replace")
+        self.assertIn("You", shown)                                                  # new headers on the real screen
+        self.assertIn("(Mgr)", shown)
+        self.assertIn("(w1)", shown)
+        term.write(b"/exit\r")
+        self.assertEqual(term.wait(30), 0, bytes(term.buf[-500:]))
+        if os.name == "posix":
+            self.assertIn(self.ALT_OFF, term.buf)                                    # alternate screen left
+        self.assertIn("Bye. Session saved".encode(), bytes(term.buf))
+        self.assertFalse((sess / "session.lock").exists() and self._locked(sess), "lock released")
 
         n_chat = len([e for e in ev if e.get("type") == "chat"])
-        proc, master, buf, close = self.spawn(["resume", sess.name], {"manager": [], "w1": []})
-        try:
-            self.assertTrue(until(lambda: b"\x1b[?1049h" in buf, 20))
-            time.sleep(1.5)
-            os.write(master, b"/exit\r")
-            self.assertEqual(proc.wait(30), 0, bytes(buf[-500:]))
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-            close()
+        term = self.spawn(["resume", sess.name], {"manager": [], "w1": []}, WT_SESSION="test")
+        self.assertTrue(until(lambda: self.ready(term), 30))
+        time.sleep(1.5)
+        term.write(b"/exit\r")
+        self.assertEqual(term.wait(30), 0, bytes(term.buf[-500:]))
         _, ev2 = self.events()
         self.assertEqual(len([e for e in ev2 if e.get("type") == "chat"]), n_chat, "replay must not add chat events")
         self.assertEqual([e for e in ev2 if e.get("type") == "turn_start"],
                          [e for e in ev if e.get("type") == "turn_start"], "replay must not run a model")
+
+    def test_ascii_override_on_a_real_terminal(self):
+        scn = {"manager": [M([final("好的")])], "w1": []}
+        term = self.spawn(["--symbols", "ascii"], scn, WT_SESSION="test")
+        self.assertTrue(until(lambda: self.ready(term), 30))
+        time.sleep(0.8)
+        term.write("hi\r")
+        self.assertTrue(until(lambda: "好的".encode() in term.buf, 60), bytes(term.buf[-400:]))
+        term.write(b"/exit\r")
+        self.assertEqual(term.wait(30), 0)
+        shown = bytes(term.buf).decode("utf-8", "replace")
+        for g in "›◆◇●○":
+            self.assertFalse(g in shown, g)
 
     def _locked(self, sess):
         from agent.sessionlock import SessionLock, SessionLocked
@@ -832,19 +899,34 @@ class TestWholeRunInAPty(Base):
                            text=True, encoding="utf-8", env=self.env(scn), cwd=self.work, timeout=90)
         self.assertEqual(r.returncode, 0, r.stderr)
         sess, _ = self.events()
-        proc, master, buf, close = self.spawn(["resume", sess.name, "--replay", "0"], {"manager": [], "w1": []})
-        try:
-            self.assertTrue(until(lambda: b"\x1b[?1049h" in buf, 20))
-            time.sleep(1.0)
-            os.write(master, b"/exit\r")
-            self.assertEqual(proc.wait(30), 0)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-            close()
-        self.assertNotIn("先前的對話".encode(), bytes(buf))
-        self.assertNotIn("第一輪".encode(), bytes(buf))
+        term = self.spawn(["resume", sess.name, "--replay", "0"], {"manager": [], "w1": []})
+        self.assertTrue(until(lambda: self.ready(term), 30))
+        time.sleep(1.0)
+        term.write(b"/exit\r")
+        self.assertEqual(term.wait(30), 0)
+        self.assertNotIn("先前的對話".encode(), bytes(term.buf))
 
-
-if __name__ == "__main__":
-    unittest.main()
+    @unittest.skipUnless(os.name == "nt", "ConPTY resize")
+    def test_resize_history_and_default_symbols_on_a_real_windows_console(self):
+        scn = {"manager": [M([final("第一個回答")]), M([final("第二個回答")])], "w1": []}
+        term = self.spawn([], scn)                                   # no WT_SESSION: the old-console policy applies
+        self.assertTrue(until(lambda: self.ready(term), 30))
+        time.sleep(0.8)
+        term.write("first 一\r")
+        self.assertTrue(until(lambda: "第一個回答".encode() in term.buf, 60), bytes(term.buf[-400:]))
+        term.pty.resize(40, 12)                                      # narrow: everything must reflow, nothing may crash
+        time.sleep(0.8)
+        term.pty.resize(120, 30)
+        time.sleep(0.8)
+        term.write(b"\x1b[A")                                        # Up: previous message comes back into the box
+        time.sleep(0.5)
+        term.write("\r")                                             # ... and sends again
+        self.assertTrue(until(lambda: "第二個回答".encode() in term.buf, 60), bytes(term.buf[-400:]))
+        term.write(b"/exit\r")
+        self.assertEqual(term.wait(30), 0, bytes(term.buf[-400:]))
+        shown = bytes(term.buf).decode("utf-8", "replace")
+        for g in "›◆◇●○":
+            self.assertFalse(g in shown, g)                          # conservative default outside Windows Terminal
+        _, ev = self.events()
+        sent = [e["text"] for e in ev if e.get("type") == "chat" and e.get("sender") == "Me"]
+        self.assertEqual(sent, ["first 一", "first 一"])

@@ -266,8 +266,12 @@ def _run_chat(args: argparse.Namespace, resume_id: Optional[str], import_id: Opt
         if use_tui:
             try:
                 from .tui import TuiApp
+                from .theme import pick_symbols
+                env = dict(os.environ)
+                if getattr(args, "symbols", None):
+                    env["AGENT_SYMBOLS"] = args.symbols
                 tuiapp = TuiApp(lambda s: _tui_line(holder, s), lambda: holder["status"](), lambda: _tui_ctrl_c(holder),
-                                history=user_inputs(prior))
+                                history=user_inputs(prior), symbols=pick_symbols(env))
             except Exception as e:               # e.g. a console prompt_toolkit cannot drive (mintty): chat as before
                 print(f"全螢幕聊天室無法在這個終端啟動（{type(e).__name__}: {e}）。改用簡易模式（可加 --plain）。", file=sys.stderr)
                 tuiapp = None
@@ -354,6 +358,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", help="use this config file instead of %%APPDATA%%\\agent\\config.json")
     p.add_argument("--plain", action="store_true", default=False,
                    help="line-based chat instead of the full-screen chat room (also used when not on a terminal)")
+    p.add_argument("--symbols", choices=("auto", "unicode", "ascii"), default=None,
+                   help="decoration glyphs of the full-screen chat room (default auto; env AGENT_SYMBOLS; "
+                        "use ascii if the symbols look misaligned)")
     sub = p.add_subparsers(dest="command")
     r = sub.add_parser("sessions", help="list saved Agent sessions")
     r.add_argument("--limit", type=int, default=20, help="show at most this many (newest)")
@@ -363,6 +370,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--replay", type=int, default=60, help="show the last N earlier chat items first (0 = none)")
     r.add_argument("--here", action="store_true", help="continue even though the current folder differs from the saved one")
     r.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    r.add_argument("--symbols", choices=("auto", "unicode", "ascii"), default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     r.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     i = sub.add_parser("import", help="import a native Claude Code session (also: agent <Claude Session UUID>): "
                                       "the Manager continues a COPY of it; the original is never modified")
@@ -372,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="import even though the session seems to come from another folder (a guess from Claude's storage)")
     i.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     i.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    i.add_argument("--symbols", choices=("auto", "unicode", "ascii"), default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     c = sub.add_parser("config", help="create the config file if missing and show its path")
     c.add_argument("--show", action="store_true", help="also print the file contents")
     c.add_argument("--config", dest="config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)

@@ -4,31 +4,32 @@ Threads: the Engine and its turn threads call TuiUI.chat/system/... from any thr
 list and ask the application to repaint (`Application.invalidate` is thread-safe). Nothing outside prompt_toolkit's
 own event loop ever writes to the terminal.
 
-Text is wrapped by display width (CJK = 2 cells) on every repaint, so a resize reflows by itself. Structure is drawn
-with plain ASCII on purpose: "ambiguous width" glyphs (box drawing, bullets) are 2 cells wide in some CJK consoles and
-would misalign the right edge."""
+Text is wrapped by display width (CJK = 2 cells) on every repaint, so a resize reflows by itself. Decoration glyphs
+come from theme.Symbols: Unicode where it is known to line up, ASCII otherwise ("ambiguous width" glyphs are 2 cells
+wide in some CJK consoles and would misalign the right edge). Message text never depends on them."""
 from __future__ import annotations
 
-import queue
 import re
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from prompt_toolkit.application import Application
-from prompt_toolkit.application.current import get_app
+from prompt_toolkit.application.current import get_app_session
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Dimension, FormattedTextControl, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
-from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 
 from .inputhistory import HISTORY_LIMIT
-from .orchestrator import fmt_elapsed, fmt_quiet, model_label
+from .modelname import header_parts, role_tag
+from .orchestrator import fmt_elapsed, fmt_quiet
+from .theme import UNICODE, Symbols, build_style, pick_symbols, pick_theme, worker_style
 from .ui import UI
 
 Line = List[Tuple[str, str]]          # one screen row: (style, text) fragments
@@ -70,6 +71,13 @@ def clip(s: str, width: int) -> str:
     return "".join(out)
 
 
+def shorten_cells(s: str, width: int) -> str:
+    """Cut to `width` cells with "..." (plain dots: the ellipsis character is ambiguous-width)."""
+    if text_width(s) <= width:
+        return s
+    return clip(s, max(0, width - 3)).rstrip() + "..." if width > 3 else clip(s, width)
+
+
 def wrap(text: str, width: int) -> List[str]:
     """Wrap by display width. Breaks at a space when the line has one, otherwise anywhere (CJK has no spaces).
     Blank lines are kept; every row is at most `width` cells (unless one character is wider than the width)."""
@@ -106,59 +114,104 @@ class Entry:
     sender: str
     text: str
     to: Optional[str] = None
-    label: Optional[str] = None     # model label of the turn that produced it (CLI-reported / requested / unknown)
+    meta: Optional[Dict[str, Any]] = None    # turn_info of the turn that produced it (reported / requested / unknown)
     replay: bool = False
     ts: float = field(default_factory=time.time)
-    _cache: Optional[Tuple[int, List[Line]]] = field(default=None, repr=False, compare=False)
+    gap_before: bool = False        # set by ChatView.add: a blank row separates it from the previous entry
+    _cache: Optional[Tuple[Tuple[int, Symbols], List[Line]]] = field(default=None, repr=False, compare=False)
 
-    def lines(self, width: int) -> List[Line]:
-        if self._cache and self._cache[0] == width:
+    def lines(self, width: int, sym: Symbols = UNICODE) -> List[Line]:
+        key = (width, sym)
+        if self._cache and self._cache[0] == key:
             return self._cache[1]
-        out = self._render(width)
-        self._cache = (width, out)
+        out = self._render(width, sym)
+        self._cache = (key, out)
         return out
 
-    def _style(self) -> str:
+    @property
+    def compact(self) -> bool:
+        return self.kind in ("system", "error", "note")
+
+    def _role(self) -> str:
         if self.kind == "error":
-            return "class:error"
+            return "error"
         if self.kind in ("system", "banner", "note"):
-            return "class:system"
-        if self.kind == "ask":
-            return "class:ask"
+            return "system"
         if self.sender == "Me":
-            return "class:me"
-        if self.sender == "Manager":
-            return "class:manager"
-        return "class:worker"
+            return "me"
+        if self.sender == "Manager" or (self.meta or {}).get("agent") == "manager":
+            return "manager"
+        return worker_style(zlib.crc32(self.sender.encode("utf-8", "replace")) % 3)
 
-    def _render(self, width: int) -> List[Line]:
-        gutter = "| " if self.replay else ""
-        dim = " class:replay" if self.replay else ""
-        inner = max(MIN_WIDTH, width) - len(gutter)
-        gstyle = "class:replay"
+    def _header(self, sym: Symbols, room: int) -> Line:
+        """`◆ Claude Sonnet 5.5 (Mgr) · 未確認 · → w1 · 14:31`, trimmed to `room` cells. When it is too narrow the
+        clock goes first, then the recipient, then the "needs your answer" note; the evidence note and the name stay,
+        and a name that still does not fit is cut (a header never wraps)."""
+        role = self._role()
+        user = role == "me"
+        mark = sym.user if user else (sym.manager if role == "manager" else sym.worker)
+        sender = one_line(self.sender, 24)
+        meta = self.meta if isinstance(self.meta, dict) else None
+        if user:
+            name, tag, evidence, extra = "You", "", "", ""
+        else:
+            h = header_parts(sender, meta)
+            name, tag, evidence, extra = one_line(h.name, 40), one_line(h.tag, 16), one_line(h.evidence, 12), one_line(h.extra, 6)
+        tag_text = f" ({tag})" if tag else ""
+        extra_text = f" {extra}" if extra else ""
+        tail: List[List[Tuple[str, str]]] = []           # optional pieces, most important first
+        if evidence:
+            tail.append([("class:evidence", evidence)])
+        if self.kind == "ask":
+            tail.append([("class:ask", "需要你的回答")])
+        to = one_line(self.to, 16) if self.to and not user and self.to not in ("Me", "Manager") else ""
+        if to:
+            tail.append([("class:dim", f"{sym.arrow} {to}")])
+        if not self.replay:
+            tail.append([("class:dim", time.strftime("%H:%M", time.localtime(self.ts)))])
+        sep = f" {sym.sep} "
 
-        def row(style: str, text: str, pre: str = "") -> Line:
-            return ([(gstyle, gutter)] if gutter else []) + ([(style + dim, pre)] if pre else []) + [(style + dim, text)]
+        def width(parts: List[List[Tuple[str, str]]], nm: str) -> int:
+            return (text_width(mark + " " + nm + extra_text + tag_text)
+                    + sum(text_width(sep) + text_width("".join(t for _, t in p)) for p in parts))
+
+        keep = list(tail)
+        while len(keep) > (1 if evidence else 0) and width(keep, name) > room:
+            keep.pop()                                   # the clock goes first, the evidence note is the last to go
+        if width(keep, name) > room:                     # still too wide: shorten the model name, not the evidence
+            spare = room - (width(keep, "") )
+            name = shorten_cells(name, max(4, spare))
+        out: Line = [(f"class:{role}", mark + " " + name + extra_text + tag_text)]
+        for piece in keep:
+            out.append(("class:dim", sep))
+            out.extend(piece)
+        if width(keep, name) > room:                     # nothing left to drop: cut, a header never wraps
+            flat = "".join(t for _, t in out)
+            return [(f"class:{role}", clip(flat, max(1, room)))]
+        return out
+
+    def _render(self, width: int, sym: Symbols) -> List[Line]:
+        gutter = sym.gutter + " " if self.replay else ""
+        inner = max(MIN_WIDTH, width) - text_width(gutter)
+        dimmed = " class:replay" if self.replay else ""
+
+        def row(frags: Line) -> Line:
+            return ([("class:replay", gutter)] if gutter else []) + [((st + dimmed).strip(), t) for st, t in frags]
 
         text = sanitize(self.text)
-        st = self._style()
+        out: List[Line] = [[]] if self.gap_before else []
+        role = self._role()
         if self.kind in ("chat", "ask"):
-            who = sanitize(self.sender + (f" -> {self.to}" if self.to else "")).replace("\n", " ")
-            head = ([] if self.replay else [time.strftime("%H:%M:%S", time.localtime(self.ts))]) + [who]
-            if self.kind == "ask":
-                head.append("[需要你的回答]")
-            if self.label:
-                head.append(f"({sanitize(self.label)})")
-            title = clip("  ".join(head), inner)
-            out = [([(gstyle, gutter)] if gutter else []) + [(st + " bold" + dim, title)]]
-            for ln in wrap(text, inner - 2):
-                out.append(row("", ln, "  "))
-            out.append([])
+            out.append(row([("", "  ")] + self._header(sym, inner - 2)))
+            for ln in wrap(text, inner - 4):
+                out.append(row([("", "    "), ("", ln)]))
             return out
-        pre, cont = {"error": ("! ", "  "), "banner": ("", ""), "note": ("~ ", "  ")}.get(self.kind, ("* ", "  "))
-        out = []
-        for i, ln in enumerate(wrap(text, inner - len(pre))):
-            out.append(row(st, ln, pre if i == 0 else cont))
+        if self.kind == "banner":
+            return [row([("class:system", ln)]) for ln in wrap(text, inner)]
+        pre = "  " + (sym.error if self.kind == "error" else sym.system) + " "
+        pw = text_width(pre)
+        for i, ln in enumerate(wrap(text, inner - pw)):
+            out.append(row([(f"class:{role}", (pre if i == 0 else " " * pw) + ln)]))
         return out
 
 
@@ -173,10 +226,13 @@ class ChatView:
         self.width = 80
         self.height = 20
         self.total = 0
+        self.symbols: Symbols = UNICODE
 
     def add(self, entry: Entry) -> None:
         with self.lock:
-            rows = len(entry.lines(self.width))
+            prev = self.entries[-1] if self.entries else None
+            entry.gap_before = prev is not None and not (prev.compact and entry.compact) and entry.kind != "banner"
+            rows = len(entry.lines(self.width, self.symbols))
             self.entries.append(entry)
             if self.scroll > 0:               # keep what the user is reading exactly where it is
                 self.scroll += rows
@@ -203,7 +259,7 @@ class ChatView:
         """The rows to show for a window of `width` x `height` cells."""
         with self.lock:
             self.width, self.height = max(MIN_WIDTH, width), max(1, height)
-            chunks = [e.lines(self.width) for e in self.entries]
+            chunks = [e.lines(self.width, self.symbols) for e in self.entries]
             self.total = sum(len(c) for c in chunks)
             self.scroll = max(0, min(self.scroll, max(0, self.total - self.height)))
             if self.scroll == 0:
@@ -246,13 +302,7 @@ class TuiUI(UI):
         self._invalidate()
 
     def chat(self, sender, text, to=None, meta=None):
-        label = None
-        if isinstance(meta, dict) and sender != "Me":
-            try:
-                label = model_label(meta)
-            except Exception:
-                label = None
-        self._add(Entry("chat", str(sender), str(text), to, label))
+        self._add(Entry("chat", str(sender), str(text), to, meta if isinstance(meta, dict) and sender != "Me" else None))
 
     def system(self, text): self._add(Entry("system", "system", str(text)))
     def error(self, text): self._add(Entry("error", "system", str(text)))
@@ -277,32 +327,13 @@ class _ReplayUI(UI):
         self.p = parent
 
     def chat(self, sender, text, to=None, meta=None):
-        label = None
-        if isinstance(meta, dict) and sender != "Me":
-            try:
-                label = model_label(meta)
-            except Exception:
-                label = None
-        self.p._add(Entry("chat", str(sender), str(text), to, label, replay=True))
+        self.p._add(Entry("chat", str(sender), str(text), to, meta if isinstance(meta, dict) and sender != "Me" else None,
+                          replay=True))
 
     def system(self, text): self.p._add(Entry("note", "system", str(text), replay=True))
     def error(self, text): self.p._add(Entry("error", "system", str(text), replay=True))
     def ask_user(self, text): self.p._add(Entry("ask", "Manager", str(text), "Me", replay=True))
 
-
-STYLE = Style.from_dict({
-    "me": "bold",
-    "manager": "ansicyan",
-    "worker": "ansigreen",
-    "ask": "ansibrightcyan",
-    "system": "ansiyellow",
-    "error": "ansired",
-    "replay": "ansibrightblack",
-    "status": "reverse",
-    "status.run": "reverse bold",
-    "title": "ansibrightblack",
-    "input-title": "ansicyan bold",
-})
 
 TITLE = "Agent 聊天室（輸入送給 Manager，不是 PowerShell）"
 KEYS = ("Enter 送出 | Ctrl+J 換行 | Up/Down 或 Ctrl+P/N 歷史 | PgUp/PgDn 捲動 | End 最新 | Ctrl+C 中斷 | /exit 離開",
@@ -320,46 +351,111 @@ def title_fragments(columns: int) -> List[Tuple[str, str]]:
     return [("class:input-title", clip(TITLE, max(1, columns - 1)))]
 
 
-def status_line(snap: Dict[str, Any], view: ChatView) -> str:
-    """One line: who is doing what, from facts the Engine really has. No progress estimate, no token count."""
-    parts: List[str] = []
-    if view.scroll > 0:
-        parts.append("[捲動中" + (f"，{view.unseen} 則新訊息" if view.unseen else "") + "；End 回到最新]")
-    agents = snap.get("agents") or []
-    for a in agents:
-        name = one_line(a.get("name"))
-        if a.get("running"):
-            s = f"{name} 執行中 {fmt_elapsed(a['elapsed'])}"
-            q = a.get("quiet")
-            if q is not None and q >= 5:
-                s += f"，{fmt_quiet(q)}沒有輸出"
-            tool = one_line(a.get("tool"))
-            if tool:
-                s += f"，工具 {tool}（{fmt_elapsed(a.get('tool_ago') or 0)}前）"
-            task = one_line(a.get("task"))
-            if task:
-                s += f"，任務 {task}"
-        else:
-            s = f"{name} 閒置"
-        if a.get("queued"):
-            s += f"（佇列 {int(a['queued'])}）"
-        parts.append(f"[{s}]")
+STATUS_GAP = "    "
+
+
+def _agent_segment(a: Dict[str, Any], level: int, sym: Symbols) -> Line:
+    """One agent's part of the status bar at detail level 3 (everything) .. 0 (dot and name). Level 3 reads like
+    `● Mgr 執行中 8s · 12 秒沒有輸出 · 工具 Read（3s前）`; lower levels drop the least useful facts first."""
+    running = bool(a.get("running"))
+    name = one_line(role_tag(str(a.get("name") or "?"), a.get("role")), 16)
+    dot = ("class:status class:status.dot.run", sym.run) if running else ("class:status class:status.dot.idle", sym.idle)
+    out: Line = [dot, ("class:status", " " + name)]
+    if level == 0:
+        return out
+    bits: List[str] = []
+    if running:
+        bits.append(f"執行中 {fmt_elapsed(a.get('elapsed') or 0)}")
+        q = a.get("quiet")
+        if level >= 3 and q is not None and q >= 5:
+            bits.append(f"{fmt_quiet(q)}沒有輸出")
+        tool = one_line(a.get("tool"))
+        if tool and level >= 2:
+            bits.append(f"工具 {tool}" + (f"（{fmt_elapsed(a.get('tool_ago') or 0)}前）" if level >= 3 else ""))
+        task = one_line(a.get("task"))
+        if task and level >= 2:
+            bits.append(f"任務 {task}")
+    else:
+        bits.append("閒置")
+    if a.get("queued") and level >= 2:
+        bits.append(f"佇列 {int(a['queued'])}")
+    sep = f" {sym.sep} "
+    out.append(("class:status", " " + bits[0]))
+    for b in bits[1:]:
+        out.append(("class:status class:status.hint", sep))
+        out.append(("class:status", b))
+    return out
+
+
+def status_fragments(snap: Dict[str, Any], view: ChatView, columns: int, sym: Symbols = UNICODE) -> Line:
+    """The status bar for `columns` cells. Facts only (no progress estimate, no token count). When it does not fit it
+    gets less detailed in a fixed order: per-agent detail goes level by level, then minor notices, then idle agents;
+    the scroll hint and the hold / waiting-for-you notices are the last to go."""
+    if columns < 3:
+        return [("class:status", "")]
+    room = columns - 2
+    agents = [a for a in (snap.get("agents") or []) if isinstance(a, dict)]
     state = snap.get("state")
+    urgent: List[str] = []
+    if view.scroll > 0:
+        urgent.append("捲動中" + (f" · {view.unseen} 則新訊息" if view.unseen else "") + " · End 回到最新")
     if snap.get("hold"):
-        parts.append("已暫停：輸入訊息或 /continue 繼續")
+        urgent.append("已暫停：輸入訊息或 /continue 繼續")
     elif snap.get("awaiting_user"):
-        parts.append("等你回答 Manager 的問題")
-    elif not any(a.get("running") for a in agents):
+        urgent.append("等你回答 Manager 的問題")
+    minor: List[str] = []
+    any_run = any(a.get("running") for a in agents)
+    if not snap.get("hold") and not snap.get("awaiting_user"):
         if state == "waiting_worker":
-            parts.append("Manager 等待 Worker")
-        elif state == "waiting_manager":
-            parts.append("等待 Manager 處理回報")
-    elif state == "waiting_worker":
-        parts.append("Manager 等待 Worker")
+            minor.append("Manager 等待 Worker")
+        elif state == "waiting_manager" and not any_run:
+            minor.append("等待 Manager 處理回報")
     st = snap.get("import_stage")
-    if st and st != "ready":
-        parts.append(f"匯入：{one_line(st, 20)}")
-    return " ".join(parts) or "準備中"
+    notes = [f"匯入：{one_line(st, 20)}"] if st and st != "ready" else []
+    hint = "class:status class:status.hint"
+
+    def build(level: int, drop_idle: bool) -> Line:
+        out: Line = []
+        for i, seg in enumerate([_agent_segment(a, level, sym) for a in agents if a.get("running") or not drop_idle]):
+            if i:
+                out.append(("class:status", STATUS_GAP))
+            out.extend(seg)
+        extra = list(urgent) + (minor if level >= 2 else []) + (notes if level >= 1 else [])
+        for text in extra:
+            if out:
+                out.append(("class:status", STATUS_GAP))
+            out.append((hint, text))
+        return out
+
+    def width(frags: Line) -> int:
+        return text_width("".join(t for _, t in frags))
+
+    chosen: Line = []
+    fits = False
+    for drop_idle in (False, True):
+        for level in (3, 2, 1, 0):
+            chosen = build(level, drop_idle)
+            if width(chosen) <= room:
+                fits = True
+                break
+        if fits:
+            break
+    if not chosen:
+        chosen = [("class:status", "準備中")]
+    out, used = [], 0                                   # last resort: cut the end, whatever is left
+    for style, text in chosen:
+        t = clip(text, room - used)
+        if t:
+            out.append((style, t))
+        used += text_width(t)
+        if t != text or used >= room:                   # cut here: nothing after a cut may slip in
+            break
+    return [("class:status", " ")] + out
+
+
+def status_line(snap: Dict[str, Any], view: ChatView, columns: int = 10000, sym: Symbols = UNICODE) -> str:
+    """Plain-text form of status_fragments (tests and logs)."""
+    return "".join(t for _, t in status_fragments(snap, view, columns, sym)).strip()
 
 
 class TuiApp:
@@ -367,11 +463,16 @@ class TuiApp:
     submitted message; `on_ctrl_c()` returns True when it did something (e.g. interrupted a running turn)."""
 
     def __init__(self, on_line: Callable[[str], None], status: Callable[[], Dict[str, Any]],
-                 on_ctrl_c: Callable[[], bool], input=None, output=None, history: Sequence[str] = ()) -> None:
+                 on_ctrl_c: Callable[[], bool], input=None, output=None, history: Sequence[str] = (),
+                 symbols: Optional[Symbols] = None, theme: Optional[str] = None, color_depth=None) -> None:
         self.on_line = on_line
         self._status = status
         self.on_ctrl_c = on_ctrl_c
         self.view = ChatView()
+        self.view.symbols = symbols or pick_symbols()
+        self.symbols = self.view.symbols
+        out = output or get_app_session().output
+        depth = color_depth or out.get_default_color_depth()
         self.ui = TuiUI(self.view, self.invalidate)
         # Up / Down / Ctrl+P / Ctrl+N are prompt_toolkit's own history keys (Up and Down move the cursor inside a
         # multi-line draft first), and the unsent draft stays at the newest position. Only what the user SENT is
@@ -380,7 +481,7 @@ class TuiApp:
         self.input = TextArea(multiline=True, wrap_lines=True, height=Dimension(min=1, max=6), dont_extend_height=True,
                               history=InMemoryHistory(self._history),
                               complete_while_typing=False, focus_on_click=True,
-                              get_line_prefix=lambda n, wrap: "Me> " if n == 0 and wrap == 0 else "    ")
+                              get_line_prefix=lambda n, wrap: [("class:prompt", "Me> ")] if n == 0 and wrap == 0 else "    ")
         kb = self._bindings()
         root = HSplit([
             Window(ChatControl(self.view), wrap_lines=False, always_hide_cursor=True),
@@ -389,7 +490,8 @@ class TuiApp:
             self.input,
         ])
         self.app: Application = Application(layout=Layout(root, focused_element=self.input), key_bindings=kb,
-                                            style=STYLE, full_screen=True, mouse_support=False, refresh_interval=1.0,
+                                            style=build_style(depth, theme or pick_theme()), color_depth=depth,
+                                            full_screen=True, mouse_support=False, refresh_interval=1.0,
                                             input=input, output=output)
 
     # ---- called from any thread
@@ -425,8 +527,10 @@ class TuiApp:
             snap = self._status() or {}
         except Exception:
             snap = {}
-        running = any(a.get("running") for a in snap.get("agents") or [])
-        return [("class:status.run" if running else "class:status", " " + status_line(snap, self.view) + " ")]
+        try:
+            return status_fragments(snap, self.view, self._columns(), self.symbols)
+        except Exception:
+            return [("class:status", " ")]
 
     def _remember(self, s: str) -> None:
         """Add one sent message (slash commands included: this lives in memory only). An immediate repeat is not added
